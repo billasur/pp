@@ -67,11 +67,33 @@ public final class BPETokenizer: SequenceTokenizer, Sendable {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let model = json["model"] as? [String: Any],
               let vocab = model["vocab"] as? [String: Int],
-              let merges = model["merges"] as? [String] else {
+              let merges = model["merges"] as? [Any] else {
             throw NSError(domain: "BPETokenizer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid tokenizer.json format"])
         }
 
-        return BPETokenizer(vocab: vocab, merges: merges)
+        // tokenizer.json encodes merges either as "a b" strings or as ["a","b"] pairs,
+        // depending on the generator. Both appear in the wild and must both load.
+        let pairs: [String] = merges.compactMap { entry in
+            if let text = entry as? String { return text }
+            if let parts = entry as? [String], parts.count == 2 { return "\(parts[0]) \(parts[1])" }
+            return nil
+        }
+        guard pairs.count == merges.count else {
+            throw NSError(domain: "BPETokenizer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unreadable merges table in tokenizer.json"])
+        }
+
+        let tokens = json["added_tokens"] as? [[String: Any]] ?? []
+        func specialID(_ content: String) -> Int? {
+            tokens.first { ($0["content"] as? String) == content }?["id"] as? Int
+        }
+
+        return BPETokenizer(
+            vocab: vocab,
+            merges: pairs,
+            clsTokenId: specialID("[CLS]") ?? 50281,
+            sepTokenId: specialID("[SEP]") ?? 50282,
+            padTokenId: specialID("[PAD]") ?? 50283,
+            maskTokenId: specialID("[MASK]") ?? 50284)
     }
 
     private func byteEncode(_ text: String) -> String {

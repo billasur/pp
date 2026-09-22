@@ -110,31 +110,31 @@ public enum SequenceBuilder {
         return [falseStr, trueStr]
     }
 
+    /// Builds a sequence from an explicit, ordered option list.
+    ///
+    /// This is the API every live code path must use. Option order decides what each
+    /// decision head's index means, so deriving it from an unordered dictionary would
+    /// silently mis-map a chosen index back to a candidate.
     public static func buildSequence(
         tokenizer: SequenceTokenizer,
         state: Any,
-        question: [String: Any],
+        questionType: String,
+        instructions: String,
+        options: [String],
         maxLen: Int = 512,
         headMaxLen: Int = 192,
-        optionOrder: [Int]? = nil,
         truncateLeft: Bool = false
     ) -> BuiltSequence {
         let maskTok = tokenizer.maskToken
-        let opts = renderOptions(question: question)
-        let order = optionOrder ?? Array(0..<opts.count)
+        let ins = instructions.replacingOccurrences(of: maskTok, with: " ")
 
-        let insRaw = "\(question["ins"] ?? "")"
-        let ins = insRaw.replacingOccurrences(of: maskTok, with: " ")
-        let qType = question["t"] as? String ?? "choice"
-
-        var headIds = tokenizer.encode("\(qType) question: \(ins)")
+        var headIds = tokenizer.encode("\(questionType) question: \(ins)")
         var optIds: [[Int]] = []
 
-        for i in order {
-            let optText = opts[i].replacingOccurrences(of: maskTok, with: " ")
+        for option in options {
+            let optText = option.replacingOccurrences(of: maskTok, with: " ")
             let encodedOpt = tokenizer.encode(" " + optText)
-            let trimmedOpt = Array(encodedOpt.prefix(48))
-            optIds.append([tokenizer.maskTokenId] + trimmedOpt)
+            optIds.append([tokenizer.maskTokenId] + Array(encodedOpt.prefix(48)))
         }
 
         var optBudget = headMaxLen - optIds.reduce(0) { $0 + $1.count }
@@ -158,21 +158,46 @@ public enum SequenceBuilder {
         let room = max(0, maxLen - ids.count - 1)
         let stateStr = serializeState(state).replacingOccurrences(of: maskTok, with: " ")
         let stateIds = tokenizer.encode(stateStr)
-
-        let st: [Int]
-        if truncateLeft {
-            st = Array(stateIds.suffix(room))
-        } else {
-            st = Array(stateIds.prefix(room))
-        }
+        let st = truncateLeft ? Array(stateIds.suffix(room)) : Array(stateIds.prefix(room))
 
         ids.append(contentsOf: st)
         ids.append(tokenizer.sepTokenId)
 
         let finalIds = Array(ids.prefix(maxLen))
         let finalMarkers = markers.filter { $0 < maxLen }
+        return BuiltSequence(inputIds: finalIds, markers: finalMarkers, options: options)
+    }
 
-        let orderedOptions = order.map { opts[$0] }
-        return BuiltSequence(inputIds: finalIds, markers: finalMarkers, options: orderedOptions)
+    /// Dictionary-based entry point, kept for replay and fixture comparisons.
+    ///
+    /// `options: nil` preserves the original unordered-dictionary behaviour used by the
+    /// parity fixtures. Live paths pass a deterministic order.
+    public static func buildSequence(
+        tokenizer: SequenceTokenizer,
+        state: Any,
+        question: [String: Any],
+        maxLen: Int = 512,
+        headMaxLen: Int = 192,
+        optionOrder: [Int]? = nil,
+        truncateLeft: Bool = false,
+        orderedOptions: [String]? = nil
+    ) -> BuiltSequence {
+        let qType = question["t"] as? String ?? "choice"
+        let ins = "\(question["ins"] ?? "")"
+
+        if let orderedOptions {
+            return buildSequence(tokenizer: tokenizer, state: state, questionType: qType,
+                                 instructions: ins, options: orderedOptions,
+                                 maxLen: maxLen, headMaxLen: headMaxLen, truncateLeft: truncateLeft)
+        }
+
+        let opts = renderOptions(question: question)
+        let order = optionOrder ?? Array(0..<opts.count)
+        let ordered = order.map { opts[$0] }
+
+        let built = buildSequence(tokenizer: tokenizer, state: state, questionType: qType,
+                                  instructions: ins, options: ordered,
+                                  maxLen: maxLen, headMaxLen: headMaxLen, truncateLeft: truncateLeft)
+        return BuiltSequence(inputIds: built.inputIds, markers: built.markers, options: order.map { opts[$0] })
     }
 }

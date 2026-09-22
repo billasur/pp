@@ -18,6 +18,7 @@ struct PpDesktopApp: App {
             if model.wakeWordEnabled {
                 Button(model.waitingForWake ? "Listening for Hey pp…" : "Resume wake-word listening") { model.startWakeListening() }
                     .disabled(model.waitingForWake)
+                Button("Turn off listening (kill switch)") { model.killListening() }
             }
             Button("Settings and commands…") { model.showSettings() }
             Button("Cancel current command") { model.cancel() }.disabled(!model.isBusy)
@@ -75,6 +76,18 @@ final class AppModel: ObservableObject {
 
     let speech = SpeechInput()
     let systemAudio = SystemAudioMonitor()
+    /// What pp remembers on this Mac. Optional at runtime: recall never blocks a command.
+    let memory = AssistantMemory.shared
+    /// Guides first-run setup, and notices a grant made in System Settings, which is the
+    /// one thing macOS never tells the app about.
+    private let onboarding = OnboardingCoordinator(probe: MacPermissionProbe(), modelReady: { PpClient.hasRealProvider })
+    private var permissionPoll: Task<Void, Never>?
+    @Published var permissionMessage: String?
+    @Published var learnedItems: [PersonalizationItem] = []
+    /// Microphone state, wake gating and the kill switch, in one place.
+    private let wake = WakeWordController()
+    private let partialRouter = PartialRouter()
+    private let preroute = PrerouteCache()
     private let hotKey = HotKey()
     private var key: String?
     /// Optional custom planner key: when present and enabled, queries user's custom API endpoint for planning.
@@ -93,6 +106,20 @@ final class AppModel: ObservableObject {
     private var capturing = false
     /// A command spoken while a chain was still running; it starts when the chain finishes.
     private var pendingCommand: (String, NSRunningApplication)?
+    /// The screen read that was started while the user was still speaking, and the
+    /// sentence it was read for. Discarded unless the finished sentence still matches.
+    private var prewarmed: (clause: String, pid: pid_t, snapshot: DesktopSnapshot)?
+    /// A deterministic command resolved while the user was still speaking. The target is
+    /// known, so the only work left when the sentence closes is to do it.
+    private var readyIntent: ReadyIntent?
+    /// What the fast path prepared. See `prepareFastPath`.
+    private struct ReadyIntent {
+        let intent: DirectIntent
+        let step: PlanStep
+        let appName: String
+        let title: String
+        let perform: @MainActor () async throws -> String
+    }
     private var awaitingClarification = false
     /// True while a command's steps are executing (not while listening).
     private var chainRunning = false
@@ -104,7 +131,16 @@ final class AppModel: ObservableObject {
     private var shortcutReady = false
 
     @Published var modelStatusMessage: String? = nil
-    var isModelReady: Bool { PpClient.hasRealProvider || hasKey }
+    @Published var modelSetupMessage: String? = nil
+    var canRestorePreviousModel: Bool { ModelInstaller.canRollBack() }
+    /// True when pp can decide: the local model is loaded, the user's own key is present,
+    /// or the user pointed pp at their own decision service.
+    var isModelReady: Bool { PpClient.hasRealProvider || hasKey || useRemoteDecision }
+    /// The user's own decision service, used instead of the local model.
+    @Published var useRemoteDecision = UserDefaults.standard.bool(forKey: "UseHTTPProvider")
+    /// The model package to fetch: a plain host, or a Hugging Face repository link.
+    var modelPackageLink: String { UserDefaults.standard.string(forKey: ModelDownloader.baseURLDefaultsKey) ?? "" }
+    var decisionServiceURL: String { UserDefaults.standard.string(forKey: DecisionEndpoint.userDefaultsKey) ?? "" }
     var isLocalModelLoaded: Bool { PpClient.hasRealProvider }
     var setupComplete: Bool { isModelReady && accessibilityAllowed && speechAllowed }
 
@@ -150,7 +186,10 @@ final class AppModel: ObservableObject {
     }
 
     func start() {
-        initializeLocalModel()
+        // A user who pointed pp at their own decision service does not want the local
+        // model loaded behind their back.
+        if !useRemoteDecision { initializeLocalModel() }
+        memory.load()
         lastExternalApp = NSWorkspace.shared.frontmostApplication.flatMap { Desktop.isControllable($0) ? $0 : nil }
         targetName = lastExternalApp?.localizedName ?? "your current app"
         appObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -172,16 +211,33 @@ final class AppModel: ObservableObject {
         }
         speech.$transcript.sink { [weak self] text in
             guard let self, self.capturing else { return }
+            // Every partial, not just long ones: "open Notes" is two words, and the whole
+            // point is to have it resolved before the user stops talking.
+            self.prepareFastPath(text)
+            if !self.waitingForWake {
+                self.headline = self.readyIntent.map { "Ready: \($0.title)" } ?? "Listening…"
+            }
             guard !self.waitingForWake else {
-                if WakePhrase.command(in: text, after: "Hey pp") != nil {
+                // The controller keeps nothing until the phrase actually fires, so a room
+                // full of conversation never turns into a command.
+                switch self.wake.ingest(partial: text) {
+                case .armed, .woke:
                     self.headline = "Wake phrase heard…"
                     self.showOverlay()
+                case .buffered, .rejected:
+                    break
                 }
                 return
             }
             self.transcript = text
             self.wordTask?.cancel(); self.wordTask = nil
             self.word = text.split(whereSeparator: \.isWhitespace).last.map(String.init)
+            // A recognised clause is enough to start the part of the work that does not
+            // depend on how the sentence ends: reading the screen in front.
+            if case .preroute(let clause) = self.partialRouter.consider(partial: text) {
+                self.preroute.store(clause: clause, value: clause)
+                self.prewarm(clause)
+            }
         }.store(in: &subscriptions)
         speech.$status.sink { [weak self] status in
             if self?.capturing == true { self?.detail = status }
@@ -209,6 +265,7 @@ final class AppModel: ObservableObject {
                 }
                 target = currentTarget
             }
+            self.wake.beginCommand()
             if let waiting = self.wakeModeAfterShortcut {
                 self.waitingForWake = waiting
                 self.wakeModeAfterShortcut = nil
@@ -218,7 +275,15 @@ final class AppModel: ObservableObject {
                 self.detail = "Queued: \(text)"
                 return
             }
-            self.run(text, in: target, started: self.releasedAt ?? Date())
+            // Acting on a partial transcript is never allowed, so the only thing a
+            // pre-read can do is save the first screen read when it still matches.
+            let matched = self.preroute.take(ifMatching: text)
+            let early = matched != nil && matched == self.prewarmed?.clause
+                && self.prewarmed?.pid == target.processIdentifier ? self.prewarmed?.snapshot : nil
+            self.preroute.clear()
+            self.prewarmed = nil
+            guard !self.runDirectIfReady(text) else { return }
+            self.run(text, in: target, started: self.releasedAt ?? Date(), firstSnapshot: early)
         }
         speech.onIdle = { [weak self] in
             guard let self, self.handsFree, !self.chainRunning else { return }
@@ -276,6 +341,83 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Downloads, verifies, smoke-tests and activates the decision model. The app bundle
+    /// stays small: weights are fetched once, and the package that was working is kept so
+    /// a bad update can be undone.
+    func installModel() {
+        modelSetupMessage = "Preparing…"
+        Task {
+            let downloader = ModelDownloader()
+            do {
+                _ = try await downloader.download { [weak self] state in
+                    Task { @MainActor in self?.modelSetupMessage = Self.describe(state) }
+                }
+                modelSetupMessage = nil
+                initializeLocalModel()
+            } catch {
+                modelSetupMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func restorePreviousModel() {
+        do {
+            _ = try ModelInstaller.rollback()
+            modelSetupMessage = nil
+            initializeLocalModel()
+        } catch { modelSetupMessage = error.localizedDescription }
+    }
+
+    /// A package the user chose. Validated before it can be activated: a checkpoint that
+    /// merely opens in MLX is not a decision model, and the failure would otherwise appear
+    /// as nonsense behaviour later rather than as a refusal here.
+    func installModelPackage() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.prompt = "Check and install"
+        panel.message = "Choose a pp model package folder. It must contain manifest.json."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        modelSetupMessage = "Checking \(url.lastPathComponent)…"
+        Task {
+            // Checksumming a model package is not main-actor work.
+            let problem = await Task.detached(priority: .userInitiated) { () -> String? in
+                do {
+                    let report = try BYOMPackageValidator.validate(directory: url)
+                    guard report.passed else {
+                        return "Not a pp model package. " + report.failures.map { "\($0.name): \($0.detail)" }.joined(separator: " ")
+                    }
+                    return nil
+                } catch { return "Not a pp model package. \(error.localizedDescription)" }
+            }.value
+            if let problem { modelSetupMessage = problem; return }
+            do {
+                let downloader = ModelDownloader()
+                _ = try await downloader.install(from: url) { [weak self] state in
+                    Task { @MainActor in self?.modelSetupMessage = Self.describe(state) }
+                }
+                modelSetupMessage = nil
+                initializeLocalModel()
+            } catch { modelSetupMessage = error.localizedDescription }
+        }
+    }
+
+    private static func describe(_ state: ModelDownloader.State) -> String {
+        switch state {
+        case .idle:
+            return "Preparing…"
+        case .verifying:
+            return "Verifying the package before anything is written…"
+        case .downloading(let file, let index, let total, let received, let totalBytes):
+            let percent = totalBytes > 0 ? Int(Double(received) / Double(totalBytes) * 100) : 0
+            return "Downloading \(file) (\(index)/\(total), \(percent)%)"
+        case .completed:
+            return "Installed and activated"
+        case .failed(let message):
+            return message
+        }
+    }
+
     func openMainInterface() {
         refreshPermissions()
         if setupComplete && wakeWordEnabled { startWakeListening() }
@@ -293,6 +435,55 @@ final class AppModel: ObservableObject {
         } catch { fail(error.localizedDescription) }
     }
 
+    /// Saves the model package link. A Hugging Face repository link is understood as a
+    /// repository rather than a folder, so the address a person sees in their browser works.
+    func saveModelPackageLink(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: ModelDownloader.baseURLDefaultsKey)
+            modelSetupMessage = "Cleared. pp will use the package in the repository's models folder."
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: ModelDownloader.baseURLDefaultsKey)
+            modelSetupMessage = "Link saved. Press Download Model to fetch and verify it."
+        }
+    }
+
+    /// Saves the user's own decision service: any endpoint that speaks pp's JSON and
+    /// returns `{"answers": {...}}`.
+    func saveDecisionService(url: String, key: String) {
+        let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedURL.isEmpty {
+            UserDefaults.standard.removeObject(forKey: DecisionEndpoint.userDefaultsKey)
+        } else {
+            UserDefaults.standard.set(trimmedURL, forKey: DecisionEndpoint.userDefaultsKey)
+        }
+        if !trimmedKey.isEmpty {
+            do {
+                try KeyStore.save(trimmedKey)
+                self.key = try KeyStore.read()
+                hasKey = self.key != nil
+            } catch { fail(error.localizedDescription); return }
+        }
+        setRemoteDecision(true)
+        headline = "Custom decision service saved"
+        detail = "pp will ask \(trimmedURL.isEmpty ? DecisionEndpoint.defaultURL.absoluteString : trimmedURL) for decisions."
+    }
+
+    /// Switches between the local model and the user's own endpoint. Only one of them
+    /// decides; running both would make behaviour depend on which one answered first.
+    func setRemoteDecision(_ on: Bool) {
+        useRemoteDecision = on
+        UserDefaults.standard.set(on, forKey: "UseHTTPProvider")
+        if on {
+            PpClient.resetProvider()
+            modelStatusMessage = "Using your own decision service."
+        } else {
+            initializeLocalModel()
+        }
+        objectWillChange.send()
+    }
+
     func savePlannerKey(_ value: String) {
         do {
             try KeyStore.save(value, account: KeyStore.customPlanner)
@@ -307,6 +498,77 @@ final class AppModel: ObservableObject {
     func grantAccessibility() {
         Desktop.requestAccess()
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+
+    /// Opens the pane that grants a permission, then watches for the grant. Polling is the
+    /// only correct approach: macOS sends no notice when a switch in System Settings moves,
+    /// and an app that does not notice looks broken to the user who just granted it.
+    func grant(_ kind: PermissionKind) {
+        onboarding.request(kind)
+        NSWorkspace.shared.open(kind.settingsURL)
+        permissionMessage = "Waiting for \(kind.title)… grant it in System Settings, then come back to pp."
+        permissionPoll?.cancel()
+        permissionPoll = PermissionPoller(interval: 1).run(coordinator: onboarding) { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.permissionMessage = nil
+                self.refreshPermissions()
+                self.headline = "Setup complete"
+                self.detail = "Hold \(self.shortcut.label) to speak."
+            }
+        }
+    }
+
+    /// The kill switch: stop capturing and forget whatever was buffered.
+    func killListening() {
+        wakeWordEnabled = false
+        cancel(showStatus: false)
+        headline = "Microphone off"
+        detail = "Wake-word listening is off. Hold \(shortcut.label) to speak, or turn listening back on in Settings."
+        showOverlay()
+    }
+
+    func refreshLearned() {
+        learnedItems = memory.items()
+        objectWillChange.send()
+    }
+
+    func setLearned(_ id: String, enabled: Bool) {
+        try? memory.store.setEnabled(id: id, enabled: enabled)
+        memory.commit()
+        refreshLearned()
+    }
+
+    func deleteLearned(_ id: String) {
+        try? memory.store.delete(id: id)
+        memory.commit()
+        refreshLearned()
+    }
+
+    func exportLearned() {
+        let panel = NSSavePanel()
+        panel.title = "Export what pp learned"
+        panel.nameFieldStringValue = "pp-learned.json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try memory.exportEverything().write(to: url, options: .atomic)
+            headline = "Exported"
+            detail = "Saved to \(url.lastPathComponent)."
+        } catch { fail(error.localizedDescription) }
+    }
+
+    /// The "delete everything" promise: learned items, the traces, and the history.
+    func deleteEverything() {
+        let alert = NSAlert()
+        alert.messageText = "Delete everything pp has learned?"
+        alert.informativeText = "This removes the command history, learned shortcuts and ranking priors from this Mac. It cannot be undone."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        memory.deleteEverything()
+        refreshLearned()
+        headline = "Deleted"
+        detail = "pp has no memory of earlier commands."
     }
 
     func grantSpeech() {
@@ -347,6 +609,7 @@ final class AppModel: ObservableObject {
         handsFree = continuous
         waitingForWake = waiting
         wakeModeAfterShortcut = resumeWake
+        if waiting { wake.rearmAfterKill(); wake.armForWake() }
         handsFreePrompt = prompt
         guard let app = prepare() else { return }
         target = app
@@ -362,6 +625,7 @@ final class AppModel: ObservableObject {
         transcript = ""
         timing = ""
         releasedAt = nil
+        readyIntent = nil
         headline = waitingForWake ? "Listening for “Hey pp” in the background" : "Listening…"
         if !waitingForWake { showOverlay() }
         let current = generation
@@ -399,6 +663,21 @@ final class AppModel: ObservableObject {
             Task { headline = await Desktop.probe(application: app) }
             return
         }
+        // Test hook for the voice fast path: `/fast open Notes` prepares the answer the way a
+        // partial transcript does, then acts on it the way the end of a sentence does. Lets the
+        // mid-sentence path be exercised without a microphone.
+        if debugHooks, text.hasPrefix("/fast ") {
+            let clause = String(text.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+            let began = Date()
+            prepareFastPath(clause)
+            guard runDirectIfReady(clause) else {
+                fail("Not a deterministic command: ‘\(clause)’. Prepared: \(readyIntent?.title ?? "nothing")")
+                return
+            }
+            log.notice("fast: \(clause, privacy: .public) prepared in \(Date().timeIntervalSince(began), privacy: .public)s")
+            return
+        }
+
         // Test hook for the target parser and its verbs, without Jev: `/act 14` performs target [14] of the window in front.
         if debugHooks, text.hasPrefix("/act "), let wanted = Int(text.dropFirst(5).trimmingCharacters(in: .whitespaces)) {
             guard Desktop.hasAccess, let app = Desktop.currentTarget(fallback: lastExternalApp) else { fail("/act needs Accessibility access and an app in front."); return }
@@ -441,12 +720,142 @@ final class AppModel: ObservableObject {
 
     private enum StepOutcome { case completed(result: String, actions: Int), stopped }
 
-    private func run(_ command: String, in first: NSRunningApplication, started: Date) {
+    /// Reads the app in front while the user is still speaking. Browsers and Electron apps
+    /// build their web-content tree on request, so asking early is what makes the first
+    /// real read quick. The result is used only if the finished sentence still starts with
+    /// the same words, and only for the first cycle.
+    private func prewarm(_ clause: String) {
+        guard let app = target, !app.isTerminated else { return }
+        let current = generation
+        Task { [weak self] in
+            guard let snapshot = try? await Desktop.capture(application: app, command: clause, includeMenus: false) else { return }
+            guard let self, self.generation == current, self.capturing else { return }
+            self.prewarmed = (clause, app.processIdentifier, snapshot)
+        }
+    }
+
+    /// Resolves a command whose words decide everything — "open Notes", "quit Slack",
+    /// "open google.com" — while the user is still speaking. Nothing is acted on here:
+    /// the answer is held for the moment the sentence closes.
+    private func prepareFastPath(_ clause: String) {
+        let intent = DirectIntentParser.parse(clause)
+        guard intent.isDeterministic else { readyIntent = nil; return }
+
+        let step: PlanStep
+        switch intent {
+        case .openApp(let name): step = PlanStep(kind: .openApp, target: name)
+        case .quitApp(let name): step = PlanStep(kind: .quitApp, target: name)
+        case .openSite(let host): step = PlanStep(kind: .openURL, target: host)
+        case .none: return
+        }
+        // The safety critic sees the fast path too. A shortcut that skipped it would be a
+        // hole in the one gate that must never be bypassed.
+        guard SafetyCritic.evaluate(step: step, goal: clause) == .safe else { readyIntent = nil; return }
+
+        switch intent {
+        case .openApp(let name):
+            guard let found = AppResolver.resolve(name) else { readyIntent = nil; return }
+            readyIntent = ReadyIntent(intent: intent, step: step, appName: found.name, title: "Opening \(found.name)") {
+                try await Desktop.activateApplication(at: found.url)
+            }
+        case .quitApp(let name):
+            guard let found = AppResolver.resolve(name), let running = found.running else { readyIntent = nil; return }
+            readyIntent = ReadyIntent(intent: intent, step: step, appName: found.name, title: "Quitting \(found.name)") {
+                try await Desktop.quitApplication(running)
+            }
+        case .openSite(let host):
+            guard let url = URL(string: "https://\(host)") else { readyIntent = nil; return }
+            readyIntent = ReadyIntent(intent: intent, step: step, appName: host, title: "Opening \(host)") {
+                try await Desktop.open(website: url)
+            }
+        case .none:
+            return
+        }
+    }
+
+    /// Runs a step whose target is named, without reading the screen.
+    ///
+    /// "Open Finder" does not need to know what is on screen — and finding out is the slow
+    /// part: reading a busy browser page takes seconds, and it tells us nothing about the
+    /// app we are about to open. Returns nil when the target cannot be resolved, which puts
+    /// the command back on the ordinary path.
+    private func performDirect(_ step: PlanStep) async -> String? {
+        guard SafetyCritic.evaluate(step: step, goal: step.summary) == .safe else { return nil }
+        switch step.kind {
+        case .openApp:
+            guard let name = step.target, let found = AppResolver.resolve(name) else { return nil }
+            return try? await Desktop.activateApplication(at: found.url)
+        case .quitApp:
+            guard let name = step.target, let found = AppResolver.resolve(name), let running = found.running else { return nil }
+            return try? await Desktop.quitApplication(running)
+        case .openURL:
+            guard let literal = step.target?.trimmingCharacters(in: .whitespaces), !literal.isEmpty,
+                  let url = URL(string: literal.contains("://") ? literal : "https://\(literal)"),
+                  url.host?.isEmpty == false else { return nil }
+            return try? await Desktop.open(website: url)
+        default:
+            return nil
+        }
+    }
+
+    /// Acts the instant the sentence closes, on work already done. A command only reaches
+    /// this path when its words name one app or one site and nothing else, and when that
+    /// name was resolved before the sentence ended.
+    @discardableResult
+    private func runDirectIfReady(_ text: String) -> Bool {
+        guard let ready = readyIntent else { return false }
+        readyIntent = nil
+        // The finished sentence must still mean what the partial meant: a mid-sentence
+        // correction must never launch the discarded guess.
+        guard DirectIntentParser.parse(text) == ready.intent else { return false }
+
+        let started = Date()
+        let current = generation
+        transcript = text
+        isBusy = true
+        chainRunning = true
+        showOverlay()
+        headline = ready.title
+        detail = "Done before you finished speaking."
+        memory.begin(clause: text, app: ready.appName)
+        Task {
+            var succeeded = false
+            defer {
+                memory.finish(succeeded: succeeded)
+                if generation == current { chainRunning = false }
+            }
+            do {
+                let result = try await ready.perform()
+                guard generation == current else { return }
+                succeeded = true
+                memory.record(step: ready.step, label: ready.appName, kind: ready.step.kind.rawValue,
+                              signature: ready.step.summary, app: ready.appName, roles: [], succeeded: true)
+                headline = result
+                detail = "No model call. Hold \(shortcut.label) for another."
+                timing = String(format: "%.2fs · decided while you spoke", Date().timeIntervalSince(started))
+            } catch {
+                guard generation == current else { return }
+                fail(error.localizedDescription)
+                return
+            }
+            guard generation == current else { return }
+            isBusy = false
+            clearPixels()
+            if handsFree { beginSpeech() }
+        }
+        return true
+    }
+
+    private func run(_ command: String, in first: NSRunningApplication, started: Date,
+                     firstSnapshot: DesktopSnapshot? = nil) {
         task?.cancel()
         generation = UUID()
         let current = generation
         transcript = command
         timing = ""
+        // A command's own status, not the last one's: headline and detail are logged
+        // together, and a stale detail reads as a stale answer.
+        detail = ""
         clearPixels()
         isBusy = true
         showOverlay()
@@ -457,7 +866,10 @@ final class AppModel: ObservableObject {
         handsFreePrompt = ""
         chainRunning = true
         task = Task {
+            var succeeded = false
             defer {
+                memory.finish(succeeded: succeeded)
+                wake.finishCommand()
                 if generation == current { chainRunning = false }
                 if let (next, app) = pendingCommand, generation == current {
                     pendingCommand = nil
@@ -473,14 +885,45 @@ final class AppModel: ObservableObject {
             do {
                 let running = NSWorkspace.shared.runningApplications.filter(Desktop.isControllable).compactMap(\.localizedName)
                 let beganPlan = Date()
-                // The first screen capture does not depend on the plan; run both at once.
+                memory.begin(clause: command, app: first.localizedName ?? "Unknown")
+                // A recalled macro answers before the planner runs, which is the point of
+                // remembering at all: a repeated command costs no model call and no network.
+                let recalled = memory.macro(for: command, app: first.localizedName)
+                let planned: (steps: [PlanStep], usage: Planner.Usage?, model: String)?
+                if let recalled {
+                    planned = (steps: recalled.steps, usage: nil, model: "learned macro")
+                } else {
+                    // Attempt planning: defaults to local GrammarPlanner; or queries custom API if enabled
+                    planned = try? await Planner.plan(utterance: command, frontApp: first.localizedName ?? "Unknown", runningApps: running, apiKey: plannerKey)
+                }
+                let planSeconds = Date().timeIntervalSince(beganPlan)
+                // Commands that name their target are finished here: reading the app in
+                // front costs hundreds of milliseconds on a quiet window and seconds on a
+                // busy page, and it says nothing about the app about to be opened.
+                if let planned, planned.steps.count == 1, let direct = await performDirect(planned.steps[0]) {
+                    try Task.checkCancellation()
+                    guard generation == current else { return }
+                    memory.begin(clause: command, app: first.localizedName ?? "Unknown")
+                    memory.record(step: planned.steps[0], label: planned.steps[0].target,
+                                  kind: planned.steps[0].kind.rawValue, signature: planned.steps[0].summary,
+                                  app: first.localizedName ?? "Unknown",
+                                  roles: [planned.steps[0].kind.rawValue], succeeded: true)
+                    memory.finish(succeeded: true)
+                    succeeded = true
+                    actions = 1
+                    headline = direct
+                    detail = "Done without reading the screen. Hold \(shortcut.label) for another."
+                    timing = String(format: "%.2fs total · %.2fs plan · no screen read", Date().timeIntervalSince(started), planSeconds)
+                    clearPixels()
+                    isBusy = false
+                    return
+                }
+                // Everything else needs the screen: start the read now and reuse it as the
+                // first cycle's snapshot.
                 async let warm = try? Desktop.capture(application: first, command: command)
-                // Attempt planning: defaults to local GrammarPlanner; or queries custom API if enabled
-                let planned = try? await Planner.plan(utterance: command, frontApp: first.localizedName ?? "Unknown", runningApps: running, apiKey: plannerKey)
 
                 if let planned, (planned.steps.count > 1 || (planned.steps.count == 1 && planned.steps[0].kind != .click)) {
                     let steps = planned.steps
-                    let planSeconds = Date().timeIntervalSince(beganPlan)
                     try Task.checkCancellation()
                     guard generation == current else { return }
                     let usage = planned.usage.map { "prompt \($0.prompt), completion \($0.completion), reasoning \($0.reasoning)" } ?? "local rule"
@@ -504,7 +947,8 @@ final class AppModel: ObservableObject {
                     timing = String(format: "%.2fs total · %.2fs plan · %.2fs decision · %d action%@", Date().timeIntervalSince(started), planSeconds, modelSeconds, actions, actions == 1 ? "" : "s")
                 } else {
                     // Direct cycle: local Laya decision loop
-                    let outcome = try await runCycles(command, app: first, generation: current, modelSeconds: &modelSeconds)
+                    let outcome = try await runCycles(command, app: first, generation: current,
+                                                      modelSeconds: &modelSeconds, firstSnapshot: firstSnapshot)
                     guard generation == current else { return }
                     if case .completed(let result, let count) = outcome {
                         actions = count
@@ -513,6 +957,7 @@ final class AppModel: ObservableObject {
                     }
                     timing = String(format: "%.2fs total · %.2fs decision · %d action%@", Date().timeIntervalSince(started), modelSeconds, actions, actions == 1 ? "" : "s")
                 }
+                succeeded = true
                 clearPixels()
                 isBusy = false
             } catch is CancellationError {
@@ -522,6 +967,17 @@ final class AppModel: ObservableObject {
                 fail(error.localizedDescription)
             }
         }
+    }
+
+    /// Records one executed action, so a command that worked can be repeated from memory
+    /// instead of from the model. The label is the control that was acted on; nothing else
+    /// from the screen is kept, and `PrivacyFilter` drops credentials and one-time codes.
+    private func remember(_ step: PlanStep?, label: String?, kind: String, signature: String? = nil,
+                          app: NSRunningApplication, snapshot: DesktopSnapshot? = nil) {
+        memory.record(step: step, label: label, kind: kind,
+                      signature: signature ?? step?.summary ?? kind,
+                      app: app.localizedName ?? "the app",
+                      roles: snapshot?.candidateRoles ?? [kind], succeeded: true)
     }
 
     /// Execute one planned step: deterministic kinds run in code; on-screen kinds are grounded by one narrow Jev question.
@@ -538,13 +994,16 @@ final class AppModel: ObservableObject {
             guard let code = keys[(step.target ?? "").lowercased()] else { throw DesktopError(message: "Unknown key '\(step.target ?? "")'.") }
             let result = try await Desktop.press(key: code, times: max(1, step.amount ?? 1), in: app)
             log.notice("\(label, privacy: .public)result: \(result, privacy: .public)")
+            remember(step, label: step.target, kind: step.kind.rawValue, app: app)
             return .completed(result: "\(step.summary)", actions: 1)
         case .skip:
             let presses = max(1, Int((Double(step.amount ?? 5) / 5).rounded()))
             _ = try await Desktop.press(key: (step.target ?? "forward").lowercased().hasPrefix("b") ? 123 : 124, times: presses, in: app)
+            remember(step, label: step.target, kind: step.kind.rawValue, app: app)
             return .completed(result: step.summary, actions: 1)
         case .scroll:
             let result = try await Desktop.scroll(down: !(step.target ?? "down").lowercased().hasPrefix("u"), times: step.amount ?? 1, in: app)
+            remember(step, label: step.target, kind: step.kind.rawValue, app: app)
             return .completed(result: result, actions: 1)
         case .openURL:
             let literal = (step.target ?? "").trimmingCharacters(in: .whitespaces)
@@ -554,6 +1013,7 @@ final class AppModel: ObservableObject {
             let browser = Desktop.isBrowser(app) ? app.bundleURL : nil
             let result = try await Desktop.open(website: url, browser: browser)
             log.notice("\(label, privacy: .public)result: \(result, privacy: .public)")
+            remember(step, label: host, kind: step.kind.rawValue, app: app)
             return .completed(result: result, actions: 1)
         default: break
         }
@@ -573,7 +1033,7 @@ final class AppModel: ObservableObject {
         var snapshot = step.kind == .menu ? nil : cached
         while true {
             try Task.checkCancellation()
-            guard generation == current, let key else { return .stopped }
+            guard generation == current else { return .stopped }
             if snapshot == nil {
                 headline = "\(label)Reading \(name(app))…"
                 snapshot = try await Desktop.capture(application: app, command: command, dictation: step.kind == .typeText ? step.text : nil, includeMenus: step.kind == .menu)
@@ -585,6 +1045,7 @@ final class AppModel: ObservableObject {
                let direct = candidates.first(where: { $0.label.lowercased() == "\(step.kind == .quitApp ? "quit" : "open") \(target)\(step.kind == .openFolder ? " folder" : "")" }) {
                 let result = try await Desktop.perform(direct, snapshot: current_)
                 log.notice("\(label, privacy: .public)direct: \(result, privacy: .public)")
+                remember(step, label: direct.label, kind: step.kind.rawValue, signature: direct.detail, app: app, snapshot: current_)
                 return .completed(result: result, actions: 1)
             }
             if candidates.isEmpty {
@@ -658,6 +1119,7 @@ final class AppModel: ObservableObject {
             do {
                 let result = try await Desktop.perform(chosen, snapshot: current_)
                 log.notice("\(label, privacy: .public)result: \(result, privacy: .public)")
+                remember(step, label: chosen.label, kind: step.kind.rawValue, signature: chosen.detail, app: app, snapshot: current_)
                 return .completed(result: result, actions: 1)
             } catch let error as DesktopError where error.stale && attempts < 2 {
                 attempts += 1
@@ -671,7 +1133,8 @@ final class AppModel: ObservableObject {
 
     /// jev-ultrafast style loop: every cycle sends the current element table, the goal, the dictation and recent actions,
     /// and asks Jev for one operation plus speculative targets in a single request. Code executes and checks freshness.
-    private func runCycles(_ goal: String, app first: NSRunningApplication, generation current: UUID, modelSeconds: inout Double) async throws -> StepOutcome {
+    private func runCycles(_ goal: String, app first: NSRunningApplication, generation current: UUID,
+                           modelSeconds: inout Double, firstSnapshot: DesktopSnapshot? = nil) async throws -> StepOutcome {
         func name(_ app: NSRunningApplication) -> String { app.localizedName ?? "the app" }
         var app = first
         let input = CommandInput(goal)
@@ -716,11 +1179,18 @@ final class AppModel: ObservableObject {
         }
         for cycle in 1...14 {
             try Task.checkCancellation()
-            guard generation == current, let key else { return .stopped }
+            guard generation == current else { return .stopped }
             headline = cycle == 1 ? "Reading \(name(app))…" : "Looking again…"
             // The command's app may have quit (it was asked to, or the user closed it); continue with the app now in front.
             if app.isTerminated { app = Desktop.currentTarget(fallback: lastExternalApp) ?? app }
-            var snapshot = try await Desktop.capture(application: app, command: goal, dictation: dictation)
+            // The read started while the user was speaking is good enough for the first
+            // cycle; every later cycle reads the screen again.
+            var snapshot: DesktopSnapshot
+            if cycle == 1, let firstSnapshot {
+                snapshot = firstSnapshot
+            } else {
+                snapshot = try await Desktop.capture(application: app, command: goal, dictation: dictation)
+            }
             // Sites such as YouTube draw their controls after the load event. Right after this command navigated, a browser page
             // with almost no page controls is a skeleton, and one that still offers exactly the old controls has not drawn the new
             // page; a person waits for it to draw, so look again (at most about 3 s).
@@ -1185,7 +1655,7 @@ final class AppModel: ObservableObject {
         let budget = goal == nil ? maxSteps : 4
         chain: while true {
             try Task.checkCancellation()
-            guard generation == current, let key else { return .stopped }
+            guard generation == current else { return .stopped }
             let number = steps.count + 1
             headline = "\(label)Reading \(name(app))…"
             detail = goal == nil ? "Finding the current controls." : command
@@ -1271,6 +1741,8 @@ final class AppModel: ObservableObject {
                 guard generation == current else { return .stopped }
                 retries = 0
                 log.notice("\(label, privacy: .public)result: \(result, privacy: .public)")
+                remember(snapshot.planStep(of: candidate), label: candidate.label,
+                         kind: snapshot.eventKind(of: candidate), signature: signature, app: app, snapshot: snapshot)
                 steps.append(candidate.label)
                 lastStep = signature
                 lastResult = result
@@ -1291,6 +1763,11 @@ final class AppModel: ObservableObject {
     }
 
     func cancel(showStatus: Bool = true) {
+        // The kill switch: stop accepting audio and forget whatever was buffered.
+        wake.kill()
+        preroute.clear()
+        prewarmed = nil
+        readyIntent = nil
         handsFree = false
         waitingForWake = false
         wakeModeAfterShortcut = nil
@@ -1441,6 +1918,7 @@ final class AppModel: ObservableObject {
     func shutdown() {
         if recordingShortcut { finishShortcutRecording(nil) }
         cancel(showStatus: false)
+        memory.shutdown()
         keyTask?.cancel()
         systemAudio.stop()
         hotKey.unregister()
@@ -1455,6 +1933,9 @@ private struct SettingsView: View {
     @State private var plannerKey = ""
     @State private var isDownloading = false
     @State private var command = ""
+    @State private var modelLink = ""
+    @State private var decisionURL = ""
+    @State private var decisionKey = ""
 
     var body: some View {
         ScrollView {
@@ -1478,19 +1959,36 @@ private struct SettingsView: View {
                         Button(isDownloading ? "Downloading…" : "Download Model") {
                             isDownloading = true
                             Task {
-                                do {
-                                    let downloader = ModelDownloader()
-                                    _ = try await downloader.download()
-                                    model.initializeLocalModel()
-                                } catch {
-                                    model.modelStatusMessage = "Download failed: \(error.localizedDescription)"
-                                }
+                                model.installModel()
                                 isDownloading = false
                             }
                         }.disabled(isDownloading)
                     }
+                    if model.canRestorePreviousModel {
+                        Button("Restore previous") { model.restorePreviousModel() }
+                            .help("Put back the model package that worked before the last install.")
+                    }
                 }
                 Text("pp operates 100% locally and offline on Apple Silicon Metal using Laya 421M. Zero cloud dependencies.")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Use a model package…") { model.installModelPackage() }
+                        .help("Install a pp model package you already have. It is checked before anything is activated.")
+                    if let message = model.modelSetupMessage {
+                        Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Text("The package is checksum-verified and smoke-tested before it becomes active, a model update never replaces the app, and the previous package is kept until you delete it.")
+                    .font(.caption).foregroundStyle(.secondary)
+
+                HStack {
+                    TextField("Model package link (https://huggingface.co/owner/repo or any host)", text: $modelLink)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Save link") { model.saveModelPackageLink(modelLink) }
+                        .disabled(modelLink.trimmingCharacters(in: .whitespacesAndNewlines) == model.modelPackageLink)
+                }
+                Text("Point at a repository that contains manifest.json. A Hugging Face repository link works as-is; the original Laya checkpoint does not, because it is PyTorch and has no manifest.")
                     .font(.caption).foregroundStyle(.secondary)
 
                 Divider()
@@ -1503,13 +2001,32 @@ private struct SettingsView: View {
                 }
                 Text("By default, pp plans locally using GrammarPlanner. Enter a key if you wish to connect your own LLM endpoint.")
                     .font(.caption).foregroundStyle(.secondary)
+
+                Toggle("Use my own decision service instead of the local model", isOn: Binding(
+                    get: { model.useRemoteDecision },
+                    set: { model.setRemoteDecision($0) }))
+                HStack {
+                    TextField("Decision service URL — returns {\"answers\": {...}}", text: $decisionURL)
+                        .textFieldStyle(.roundedBorder)
+                    SecureField("Key (optional)", text: $decisionKey)
+                        .textFieldStyle(.roundedBorder).frame(width: 140)
+                    Button("Save service") {
+                        model.saveDecisionService(url: decisionURL, key: decisionKey)
+                        decisionKey = ""
+                    }.disabled(decisionURL.trimmingCharacters(in: .whitespacesAndNewlines) == model.decisionServiceURL)
+                }
+                Text("Let the whole decision step run on your own model, local or remote. pp sends the on-screen controls and your command, and expects one JSON answer per question.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             VStack(alignment: .leading, spacing: 8) {
                 Text("2. Allow access").font(.headline)
                 HStack {
-                    Button(model.accessibilityAllowed ? "Accessibility enabled" : "Enable Accessibility") { model.grantAccessibility() }
+                    Button(model.accessibilityAllowed ? "Accessibility enabled" : "Enable Accessibility") { model.grant(.accessibility) }
                     Button(model.speechAllowed ? "Speech enabled" : "Enable microphone & speech") { model.grantSpeech() }
                     Button { model.refreshPermissions() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh access status")
+                }
+                if let message = model.permissionMessage {
+                    Text(message).font(.caption).foregroundStyle(.orange)
                 }
                 if !model.accessibilityAllowed {
                     HStack(alignment: .top) {
@@ -1539,6 +2056,37 @@ private struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Button("Done — use voice widget") { model.showVoiceWidget() }.disabled(!model.setupComplete)
             }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("4. What pp has learned").font(.headline)
+                Text("pp remembers what worked on this Mac so a repeated command costs almost nothing. Everything here stays on this Mac.")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Text("\(model.memory.historyCount()) actions in history").font(.subheadline)
+                    Spacer()
+                    Button("Export…") { model.exportLearned() }.disabled(!model.setupComplete)
+                    Button("Delete everything…") { model.deleteEverything() }
+                }
+                if model.learnedItems.isEmpty {
+                    Text("Nothing learned yet. Run a command a few times and it appears here.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.learnedItems) { item in
+                        HStack(alignment: .top, spacing: 8) {
+                            Toggle("", isOn: Binding(get: { item.enabled },
+                                                     set: { model.setLearned(item.id, enabled: $0) }))
+                                .labelsHidden()
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.title).font(.subheadline)
+                                Text(item.detail).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button { model.deleteLearned(item.id) } label: { Image(systemName: "trash") }
+                                .buttonStyle(.borderless)
+                                .help("Forget this")
+                        }
+                    }
+                }
+            }
             Divider()
             VStack(alignment: .leading, spacing: 8) {
                 Text("Or type a command").font(.headline)
@@ -1565,6 +2113,11 @@ private struct SettingsView: View {
             if model.recordingShortcut { model.finishShortcutRecording(nil) }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.refreshPermissions() }
+        .onAppear {
+            model.refreshLearned()
+            modelLink = model.modelPackageLink
+            decisionURL = model.decisionServiceURL
+        }
     }
 }
 

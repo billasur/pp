@@ -1,8 +1,8 @@
 import Foundation
 
 /// A wake phrase must lead the utterance. Preserve the original command text.
-enum WakePhrase {
-    static func command(in utterance: String, after phrase: String) -> String? {
+public enum WakePhrase {
+    public static func command(in utterance: String, after phrase: String) -> String? {
         func words(_ text: String) -> [(String, Range<String.Index>)] {
             var result: [(String, Range<String.Index>)] = []
             var start: String.Index?

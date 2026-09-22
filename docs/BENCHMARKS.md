@@ -24,3 +24,26 @@ Measured natively on Apple Silicon in-process (`MLX Swift`, fp16).
 - **Threshold**: < 1500 ms (1.5s), 100% Top-1 agreement
 - **Result**: **PASS** (Phase 2 completed with exact numerical and decision parity).
 
+
+## How to reproduce
+
+```sh
+# Python oracle on MPS: fixtures, parity data and the latency table above
+tools/make_fixtures.py            # regenerate fixtures/laya_fixtures.jsonl
+tools/bench_laya.py               # p50/p95 and peak RSS for each workload shape
+
+# Swift side: parity against the same fixtures, with per-bucket reporting
+xcrun swift test --filter LayaParityTests
+```
+
+Both runs report per option-count bucket, because the `choice:11+` bucket runs at a
+temperature of 0.1: it is answered close to argmax, which makes it both the most useful
+bucket for target selection and the first place a quantisation error shows up. A single
+average would hide that.
+
+## What these numbers are not
+
+They are burst measurements on a fanless MacBook Air. A short question is tens of
+milliseconds; sustained back-to-back fp16 encoder passes warm the package and the machine
+throttles. Energy and thermal behaviour need `powermetrics` under a sustained loop, and
+those numbers are not in this file yet.

@@ -950,6 +950,30 @@ enum Desktop {
     }
 
     /// Wait until the app is active and its focused window title has stopped changing, so the next capture sees the real state.
+    /// Brings an app to the front, or starts it, with no snapshot to act against.
+    ///
+    /// The fast path for "open Notes": the target was resolved while the user was still
+    /// speaking, so this is the only work left between the last word and the app appearing.
+    @MainActor
+    static func activateApplication(at url: URL) async throws -> String {
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        let opened = try await NSWorkspace.shared.openApplication(at: url, configuration: config)
+        try await settle(opened, stableFor: 0.2, timeout: 3)
+        let name = opened.localizedName ?? url.deletingPathExtension().lastPathComponent
+        return opened.isActive ? "Opened \(name)" : "Launch requested: \(name)"
+    }
+
+    /// Quits a running app by name, with no snapshot to act against.
+    @MainActor
+    static func quitApplication(_ app: NSRunningApplication) async throws -> String {
+        let name = app.localizedName ?? "The app"
+        guard !app.isTerminated else { return "\(name) is already closed" }
+        app.terminate()
+        for _ in 0..<20 where !app.isTerminated { try await Task.sleep(nanoseconds: 100_000_000) }
+        return app.isTerminated ? "Quit \(name)" : "\(name) is asking before it quits; answer it on screen"
+    }
+
     static func settle(_ app: NSRunningApplication, stableFor: TimeInterval, timeout: TimeInterval) async throws {
         let ax = AXUIElementCreateApplication(app.processIdentifier)
         let deadline = Date().addingTimeInterval(timeout)

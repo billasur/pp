@@ -1,10 +1,30 @@
-import Foundation
-import Accelerate
 import AVFoundation
+import Accelerate
+import Foundation
 
-/// Lightweight, 100% offline End-Of-Utterance (EOU) and Voice Activity Detector (VAD).
-/// Designed for low-latency voice streaming on Apple Silicon without cloud dependencies.
-public final class ParakeetEOU: @unchecked Sendable {
+
+/// End-of-utterance signal produced while audio streams in.
+public enum EndOfUtteranceEvent: Sendable, Equatable {
+    case speechStarted
+    case speechContinuing(dbfs: Float)
+    case endOfUtterance(totalDuration: Double)
+}
+
+/// Closes a spoken clause. The shipping implementation is an energy gate; a neural
+/// model can replace it behind this protocol without touching callers.
+public protocol EndOfUtteranceDetecting: AnyObject, Sendable {
+    func reset()
+    func process(buffer: AVAudioPCMBuffer) -> EndOfUtteranceEvent?
+}
+
+/// Energy-threshold end-of-utterance detector used to close a spoken clause.
+///
+/// This is deliberately *not* a neural model. It is an RMS gate over 16 kHz buffers
+/// that reports when the speaker has stopped for long enough to end a clause. Speech
+/// recognition itself is provided by `SpeechInput` (Apple's on-device recogniser).
+/// A neural end-of-utterance model (Parakeet EOU on the Neural Engine) can replace
+/// this behind the same `EndOfUtteranceDetecting` interface without touching callers.
+public final class EnergyEOU: EndOfUtteranceDetecting, @unchecked Sendable {
     public struct Config: Sendable {
         public let sampleRate: Double
         public let silenceThresholdDbfs: Float
@@ -22,12 +42,6 @@ public final class ParakeetEOU: @unchecked Sendable {
             self.silenceDurationSeconds = silenceDurationSeconds
             self.speechLeadDurationSeconds = speechLeadDurationSeconds
         }
-    }
-
-    public enum Event: Sendable {
-        case speechStarted
-        case speechContinuing(dbfs: Float)
-        case endOfUtterance(totalDuration: Double)
     }
 
     public let config: Config
@@ -48,14 +62,13 @@ public final class ParakeetEOU: @unchecked Sendable {
     }
 
     /// Process a float audio buffer, returning an event if state changed.
-    public func process(buffer: AVAudioPCMBuffer) -> Event? {
+    public func process(buffer: AVAudioPCMBuffer) -> EndOfUtteranceEvent? {
         guard let channelData = buffer.floatChannelData else { return nil }
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0 else { return nil }
 
         totalFramesProcessed += Int64(frameCount)
 
-        // Compute RMS dBFS across channels
         var rms: Float = 0
         vDSP_rmsqv(channelData[0], 1, &rms, vDSP_Length(frameCount))
         let dbfs = 20.0 * log10(max(rms, 1e-6))
@@ -71,16 +84,13 @@ public final class ParakeetEOU: @unchecked Sendable {
                 return .speechStarted
             }
             return .speechContinuing(dbfs: dbfs)
-        } else {
-            if isSpeaking, let last = lastAudibleTime {
-                let silenceDuration = now.timeIntervalSince(last)
-                if silenceDuration >= config.silenceDurationSeconds {
-                    isSpeaking = false
-                    let totalDuration = speechStartTime.map { now.timeIntervalSince($0) } ?? 0
-                    return .endOfUtterance(totalDuration: totalDuration)
-                }
-            }
-            return nil
         }
+
+        guard isSpeaking, let last = lastAudibleTime else { return nil }
+        let silenceDuration = now.timeIntervalSince(last)
+        guard silenceDuration >= config.silenceDurationSeconds else { return nil }
+        isSpeaking = false
+        let totalDuration = speechStartTime.map { now.timeIntervalSince($0) } ?? 0
+        return .endOfUtterance(totalDuration: totalDuration)
     }
 }

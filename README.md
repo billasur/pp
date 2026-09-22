@@ -14,6 +14,11 @@ You speak or type what you want; `pp` reads the current screen state through the
 - **Optional BYO-API (Bring Your Own API)**: If desired, users can enter a custom endpoint (OpenAI, OpenRouter, local Ollama/vLLM) in Settings for extended LLM planning.
 - **Safety Critic**: Gated confirmation for destructive (`delete`, `trash`, `rmdir`), outward-facing (`send`, `post`, `tweet`, `mail`), and financial actions (`buy`, `pay`, `checkout`).
 - **No Screenshots**: Inspects controls via native macOS Accessibility APIs. Passwords and secure input fields are never read.
+- **Remembers what worked**: Repeated commands become private macros on this Mac, retrieved before the model runs, so the third time costs milliseconds instead of a decision. Everything learned is listed in Settings, can be switched off, exported, and deleted.
+- **Wake word with a kill switch**: "Hey pp" is gated by a microphone state machine that holds no audio until the phrase fires, and one click stops capture and discards the buffer.
+- **Bring your own model**: Any package that passes the contract checks (architecture, tokenizer and special-token IDs, sequence layout, required heads) can be installed from Settings. A checkpoint that merely opens is not accepted.
+- **Bring your own link, or your own API**: Paste a Hugging Face repository link (or any host) and pp downloads, checksums and smoke-tests the package. Or switch the whole decision step to your own endpoint — local or remote — and pp will send it the on-screen controls and your command.
+- **Acts before you finish the sentence**: "Open Notes", "quit Slack" and "open a web address" name their target, so pp resolves the app while you are still talking and launches it the moment you stop. No screen read, no model call — around a third of a second, measured.
 
 ---
 
@@ -34,8 +39,9 @@ open "$HOME/Applications/pp.app"
 
 On first launch:
 1. Allow **Accessibility** and **Microphone & Speech** permissions in System Settings.
-2. Hold **Control–Option–Space** (or your custom shortcut), speak, and release.
-3. Or invoke from the terminal:
+2. Download the decision model if it is not already in `~/Library/Application Support/pp/models`. The app bundle stays small; weights are fetched once, checksum-verified, smoke-tested, and activated atomically. After that, operation is offline.
+3. Hold **Control–Option–Space** (or your custom shortcut), speak, and release.
+4. Or invoke from the terminal:
 ```sh
 scripts/say.sh "Open Finder"
 ```
@@ -44,13 +50,49 @@ scripts/say.sh "Open Finder"
 
 ## How It Works
 
-Each decision cycle runs locally in ~60ms on Apple Silicon:
+Each decision cycle runs locally on Apple Silicon. Measured latency is in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) — a short question (router, safety, verifier) is
+tens of milliseconds, a full target-selection question at the 512-token budget is a few
+hundred, and a whole spoken step end to end is a few hundred milliseconds. That last
+number is the one to quote, and it is measured on the machine in the benchmark file, not
+assumed.
 
 1. **Observe**: Traverses the active app's Accessibility tree. Each interactive element (buttons, tabs, inputs, menus) is converted into a structured candidate with its role, title, and coordinates.
 2. **Plan**: `GrammarPlanner` parses compound instructions into sequential steps (`openApp`, `openURL`, `focusInput`, `typeText`, `pressKey`, `menu`, `click`).
 3. **Decide**: The local **Laya 421M** MLX model evaluates candidates against the current state and goal, predicting the target element and verifying completion using its calibrated `noul` head.
 4. **Safety Check**: `SafetyCritic` inspects candidate actions for destructive or outward effects; any high-risk action requires explicit user confirmation.
 5. **Execute**: Synthesizes native macOS events (clicks, key presses, text insertion) via CoreGraphics.
+6. **Verify**: Re-reads the screen, compares against the effect the step was supposed to have, and retries or replans within a bounded budget instead of repeating blindly.
+7. **Remember**: Records what was acted on — the label of the control, never what it said — so a repeated command can be recalled as a macro. Credentials, one-time codes, secure fields, and clipboard contents are refused before anything is stored.
+
+---
+
+## Why it feels fast
+
+Measured on this machine, in the app, driven by `scripts/say.sh`:
+
+| Command | Path | Time |
+| :--- | :--- | :--- |
+| `open Finder` | name resolved, no screen read | ~370 ms |
+| `/fast open Notes` | prepared mid-sentence, then launched | prepared in 237 ms, launched at once |
+| `open google.com` | prepared mid-sentence (warm cache) | prepared in 1.5 ms, launched at once |
+| `scroll down` | local grammar plan, one native action | ~390 ms |
+
+The expensive part of a desktop command is never the model: it is reading the app in front.
+On a quiet window that is ~200-400 ms; on a loaded browser page it was 3.1 seconds in
+testing. So commands that name their target skip it entirely, and the ones that cannot are
+read once and reused.
+
+Type a command into the box in Settings, or from a terminal:
+
+```sh
+scripts/say.sh "open Notes"
+scripts/say.sh "scroll down"
+```
+
+With `defaults write local.pp DebugHooks -bool true`, three test hooks appear:
+`/probe` dumps what pp can see in the front window, `/act 14` performs control 14, and
+`/fast open Notes` exercises the mid-sentence path without a microphone.
 
 ---
 
@@ -64,12 +106,38 @@ Each decision cycle runs locally in ~60ms on Apple Silicon:
 ## Testing & Verification
 
 ```sh
-# Run full test suite (35 tests including 410/410 Laya MLX parity evaluation)
+# Run full test suite (186 tests, including 410/410 Laya MLX parity evaluation)
 xcrun swift test
 
 # Run desktop integration checks
 ./scripts/check-desktop.sh
 ```
+
+The suite is layered: pure functions first (sequence building, shortlisting, safety rules,
+coreference, macro mining), then Swift-versus-Python parity on committed fixtures, then
+replay of recorded trees with no UI, no audio and no model weights. The parity suite is the
+one that matters most: a ported encoder with sliding-window attention, per-layer RoPE theta
+and a temperature bucket of 0.1 has many places to be quietly wrong, and quiet wrongness in
+a decision model looks like a UX bug rather than a crash.
+
+---
+
+## What is not finished
+
+Two things are contracts rather than complete products, and saying so is more useful than
+pretending otherwise:
+
+- **Browser and plugin adapters.** The adapter protocol, capability manifest, origin
+  scoping, JSON-RPC plugin host, sandboxing rules and the shared conformance suite are
+  implemented and tested. A Chromium MV3 extension, a Firefox/WebExtension adapter and a
+  published plugin ecosystem are not, because they cannot be validated without those
+  browsers and a real plugin to run against them.
+- **Per-install LoRA training.** The versioned redacted training schema, the corpus, the
+  compatibility checks, the evaluation gate (a candidate that regresses any blocking safety
+  fixture is rejected no matter how accurate it is) and the byte-identical adapter store
+  with rollback are implemented and tested. The training loop itself is not: it needs real,
+  consented traces from an alpha that has not run yet, and faking it would produce a number
+  nobody should believe.
 
 ---
 

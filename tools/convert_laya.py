@@ -181,36 +181,19 @@ def convert_laya(
         json.dump(unified_cfg, f, indent=2)
     print(f"Wrote unified config to {out_cfg}.")
 
-    # 8. Generate manifest.json with SHA256 checksums
-    files_to_hash = [
-        "model.safetensors",
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-    ]
-    file_manifest = {}
-    for fname in files_to_hash:
-        fpath = out_path / fname
-        if fpath.exists():
-            file_manifest[fname] = {
-                "size_bytes": fpath.stat().st_size,
-                "sha256": compute_sha256(fpath),
-            }
+    # 8. Generate manifest.json. One generator only: Tools/make_manifest.py, so the
+    # conversion output and a hand-refreshed manifest can never disagree.
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import make_manifest
 
-    manifest = {
-        "manifest_version": "1.0.0",
-        "model_id": "convaiinnovations/laya",
-        "package_name": "laya-421m-mlx",
-        "precision": dtype,
-        "format": "safetensors",
-        "min_pp_version": "1.0.0",
-        "files": file_manifest,
-    }
-
+    manifest = make_manifest.build(out_path)
+    manifest["precision"] = dtype
     manifest_file = out_path / "manifest.json"
     with open(manifest_file, "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"Wrote package manifest to {manifest_file}.")
+    print(f"Wrote package manifest to {manifest_file} ({len(manifest['files'])} files).")
+
     print("=== Conversion Complete ===")
 
 

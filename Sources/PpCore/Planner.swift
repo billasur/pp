@@ -1,8 +1,8 @@
 import Foundation
 
 /// One planned step in a closed vocabulary. Code executes the deterministic kinds; pp grounds the on-screen ones.
-public struct PlanStep: Codable, Equatable {
-    public enum Kind: String, Codable, CaseIterable {
+public struct PlanStep: Codable, Equatable, Sendable {
+    public enum Kind: String, Codable, CaseIterable, Sendable {
         case openApp = "open_app", openURL = "open_url", openFolder = "open_folder", click, focusInput = "focus_input",
              typeText = "type_text", pressKey = "press_key", menu, scroll, skip, quitApp = "quit_app"
     }
@@ -51,6 +51,10 @@ public enum Planner {
     public static var isCustomPlannerEnabled: Bool {
         UserDefaults.standard.bool(forKey: "CustomPlannerEnabled")
     }
+
+    /// The step vocabulary described to a planner. Exposed so a local planner can use
+    /// the same contract instead of inventing a second one.
+    public static var systemInstructions: String { system }
 
     private static let system = """
         You convert one spoken command for a Mac into an ordered list of atomic steps for a desktop controller. \

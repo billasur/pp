@@ -46,6 +46,10 @@ struct DesktopChecks {
         precondition(WakePhrase.command(in: "Hey pp, type Hello, world!", after: "Hey pp") == "type Hello, world!")
         precondition(WakePhrase.command(in: "Hey p p, open Finder", after: "Hey pp") == "open Finder")
         precondition(WakePhrase.command(in: "Hey pee pee, open Finder", after: "Hey pp") == "open Finder")
+        // The fast path behind "open Notes" finishing before the sentence ends: the words
+        // must name exactly one target, and the target must resolve without a screen read.
+        precondition(DirectIntentParser.parse("open finder") == .openApp(name: "finder"))
+        precondition(DirectIntentParser.parse("open finder and search for reports") == .none)
         let noSpeech = NSError(domain: "kAFAssistantErrorDomain", code: 1110)
         var restarts = 0
         var failures = 0

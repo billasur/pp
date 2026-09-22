@@ -22,7 +22,7 @@ final class SpeechInput: ObservableObject {
 
     private let engine = AVAudioEngine()
     private let recognizer = SFSpeechRecognizer()
-    private let eouDetector = ParakeetEOU()
+    private let eouDetector = EnergyEOU()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private var audioGate: OSAllocatedUnfairLock<Bool>?
