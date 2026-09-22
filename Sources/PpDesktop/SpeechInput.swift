@@ -12,6 +12,8 @@ final class SpeechInput: ObservableObject {
     @Published var status = ""
     @Published var audioLevel: Double = 0
     var onFinal: ((String) -> Void)?
+    var onPartial: ((String) -> Void)?
+    var onClauseClosed: (() -> Void)?
     var onIdle: (() -> Void)?
     var onFailure: ((String) -> Void)?
 
@@ -116,8 +118,9 @@ final class SpeechInput: ObservableObject {
             if let event = self?.eouDetector.process(buffer: buffer) {
                 if case .endOfUtterance = event {
                     Task { @MainActor [weak self] in
-                        guard let self, self.generation == current, self.isListening, self.handsFree else { return }
-                        if !self.transcript.isEmpty {
+                        guard let self, self.generation == current, self.isListening else { return }
+                        self.onClauseClosed?()
+                        if self.handsFree && !self.transcript.isEmpty {
                             self.finish()
                         }
                     }
@@ -144,6 +147,7 @@ final class SpeechInput: ObservableObject {
                     let text = result.bestTranscription.formattedString
                     if text != self.transcript {
                         self.transcript = text
+                        self.onPartial?(text)
                         if self.handsFree, !text.isEmpty, !self.releaseRequested {
                             self.silenceTask?.cancel()
                             self.silenceTask = Task { [weak self] in
@@ -272,7 +276,9 @@ final class SpeechInput: ObservableObject {
     }
 
     // Keep an empty hands-free session alive after Apple's normal silence timeout.
-    // Never execute partial text or suppress unrelated recognition failures.
+    // Partial text may drive only the preempt allowlist (launch, focus/open-app, quit-app, open-URL)
+    // and must never reach the planner, the model, or any effect outside that allowlist.
+    // Never suppress unrelated recognition failures.
     func handleRecognitionError(_ error: NSError, handsFree: Bool) {
         if handsFree, transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            error.domain == "kAFAssistantErrorDomain", error.code == 1110 {

@@ -28,17 +28,20 @@ public final class EnergyEOU: EndOfUtteranceDetecting, @unchecked Sendable {
     public struct Config: Sendable {
         public let sampleRate: Double
         public let silenceThresholdDbfs: Float
+        public let whisperCeilingDbfs: Float
         public let silenceDurationSeconds: Double
         public let speechLeadDurationSeconds: Double
 
         public init(
             sampleRate: Double = 16000.0,
             silenceThresholdDbfs: Float = -40.0,
+            whisperCeilingDbfs: Float = -24.0,
             silenceDurationSeconds: Double = 0.45,
             speechLeadDurationSeconds: Double = 0.15
         ) {
             self.sampleRate = sampleRate
             self.silenceThresholdDbfs = silenceThresholdDbfs
+            self.whisperCeilingDbfs = whisperCeilingDbfs
             self.silenceDurationSeconds = silenceDurationSeconds
             self.speechLeadDurationSeconds = speechLeadDurationSeconds
         }

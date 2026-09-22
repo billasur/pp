@@ -18,5 +18,8 @@
     <key>NSDesktopFolderUsageDescription</key><string>Find the names of Desktop folders you ask to open. File contents are not read.</string>
     <key>NSDocumentsFolderUsageDescription</key><string>Identify folders shown in Finder so they can be opened by voice. File contents are not read.</string>
     <key>NSDownloadsFolderUsageDescription</key><string>Identify folders shown in Finder so they can be opened by voice. File contents are not read.</string>
+    <key>NSAppleEventsUsageDescription</key><string>Control macOS system settings and automate supported applications like Clock, Finder, and System Events.</string>
+    <key>NSCalendarsUsageDescription</key><string>Create and read reminder events scheduled by voice.</string>
+    <key>NSRemindersUsageDescription</key><string>Create and complete reminders scheduled by voice.</string>
 </dict>
 </plist>

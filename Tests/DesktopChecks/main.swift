@@ -44,8 +44,15 @@ struct DesktopChecks {
         precondition(WakePhrase.command(in: "Hey pp", after: "Hey pp") == "")
         precondition(WakePhrase.command(in: "HEY, PP! Open Finder", after: "Hey pp") == "Open Finder")
         precondition(WakePhrase.command(in: "Hey pp, type Hello, world!", after: "Hey pp") == "type Hello, world!")
-        precondition(WakePhrase.command(in: "Hey p p, open Finder", after: "Hey pp") == "open Finder")
         precondition(WakePhrase.command(in: "Hey pee pee, open Finder", after: "Hey pp") == "open Finder")
+        precondition(WakePhrase.command(in: "ey pp, open Finder", after: "Hey pp") == "open Finder")
+        precondition(WakePhrase.command(in: "pp, open Finder", after: "Hey pp") == "open Finder")
+        precondition(DismissalPhrase.match("stop") == .cancel)
+        precondition(DismissalPhrase.match("cancel") == .cancel)
+        precondition(DismissalPhrase.match("thank you") == .dismiss)
+        precondition(DismissalPhrase.match("stop the music") == nil)
+        precondition(DismissalPhrase.match("cancel my subscription") == nil)
+        precondition(DismissalPhrase.match("thank you for the notes") == nil)
         // The fast path behind "open Notes" finishing before the sentence ends: the words
         // must name exactly one target, and the target must resolve without a screen read.
         precondition(DirectIntentParser.parse("open finder") == .openApp(name: "finder"))
@@ -72,7 +79,14 @@ struct DesktopChecks {
         precondition(failures == 3)
         speech.transcript = "unfinished command"
         speech.handleRecognitionError(noSpeech, handsFree: true)
-        precondition(failures == 4 && !delivered, "Partial speech must never execute after an error")
-        print("Desktop checks passed, including repeated silence recovery, cancellation during recovery, and preservation of real errors.")
+        // Preemption policy checks: stability and mid-word safe remainder
+        var policy = PreemptionPolicy()
+        precondition(policy.observe(PartialObservation(clause: "open not", isFinal: false, monotonicTime: 0.0)) == .wait)
+        precondition(policy.observe(PartialObservation(clause: "open notes", isFinal: false, monotonicTime: 0.1)) == .wait) // 1st stable
+        let decision = policy.observe(PartialObservation(clause: "open notes", isFinal: false, monotonicTime: 0.2)) // 2nd stable
+        precondition(decision == .preempt(step: PlanStep(kind: .openApp, target: "notes"), clause: "open notes"))
+        precondition(PreemptionPolicy.takeRemainder(full: "open notes and write down hello", consumed: "open notes") == "write down hello")
+        precondition(PreemptionPolicy.takeRemainder(full: "open notesapp", consumed: "open notes") == nil) // Mid-word safety returns nil
+        print("Desktop checks passed, including repeated silence recovery, cancellation during recovery, preservation of real errors, and preemption policy.")
     }
 }

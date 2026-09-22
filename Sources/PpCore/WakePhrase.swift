@@ -27,18 +27,31 @@ public enum WakePhrase {
         // Exact prefix match
         if spoken.count >= expected.count {
             let spokenPrefix = Array(spoken.prefix(expected.count).map { $0.0 })
-            let recognizedVariant = expectedWords == ["hey", "jev"] && spokenPrefix == ["hey", "jeff"]
+            let recognizedVariant = (expectedWords == ["hey", "jev"] && spokenPrefix == ["hey", "jeff"])
+                || (expectedWords == ["hey", "pp"] && spokenPrefix == ["ey", "pp"])
             if spokenPrefix == expectedWords || recognizedVariant {
                 let end = spoken[expected.count - 1].1.upperBound
                 return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
 
-        // Handle phonetic split variants for "hey pp" -> "hey p p" or "hey pee pee"
+        // Handle phonetic split variants for "hey pp" -> "hey p p", "hey pee pee", "ey p p", "ey pee pee"
         if expectedWords == ["hey", "pp"] && spoken.count >= 3 {
             let threePrefix = Array(spoken.prefix(3).map { $0.0 })
-            if threePrefix == ["hey", "p", "p"] || threePrefix == ["hey", "pee", "pee"] {
+            if threePrefix == ["hey", "p", "p"] || threePrefix == ["hey", "pee", "pee"]
+                || threePrefix == ["ey", "p", "p"] || threePrefix == ["ey", "pee", "pee"] {
                 let end = spoken[2].1.upperBound
+                return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        // Whispered / quiet bare wake: "pp, open Finder" or "p p, open Finder"
+        if expectedWords == ["hey", "pp"] && spoken.count >= 1 {
+            if spoken[0].0 == "pp" {
+                let end = spoken[0].1.upperBound
+                return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if spoken.count >= 2 && spoken[0].0 == "p" && spoken[1].0 == "p" {
+                let end = spoken[1].1.upperBound
                 return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }

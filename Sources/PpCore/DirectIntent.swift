@@ -55,7 +55,7 @@ public enum DirectIntentParser {
     // MARK: - Pieces
 
     /// "Open Notes." and "open  NOTes" are the same command.
-    static func normalize(_ text: String) -> String {
+    public static func normalize(_ text: String) -> String {
         let lowered = text.lowercased()
         let words = lowered.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         return words.joined(separator: " ").trimmingCharacters(in: CharacterSet(charactersIn: " .,!?;:"))

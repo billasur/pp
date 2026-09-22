@@ -6,12 +6,68 @@ sentence carried out after. Plus the things a person expects to be there anyway:
 timers, volume, dark mode, lock, screenshots, a browser that works by element rather than by
 screenshot, and a way to learn a command nobody wrote a tool for.
 
-Status: plan only. Nothing in this document has been built. Part II is written against the
-code as it exists today, so the first job is to *not* rebuild things that are already here.
+Status: plan only. Nothing described in Parts I and III has been built. The base assistant it
+builds on is already in the repo (199 tests green), so the first job is to *not* rebuild it —
+Part 0 maps what exists, Part II lists it file by file.
 
 Written 2026-09-23. Supersedes `docs/JEFF_BUILD_PLAN.md` for anything about latency, the
 decision loop, and the safety gates; that document is still correct about the model, the
 fixtures and the packaging.
+
+---
+
+## Part 0 — How to read this, and what it does not cover
+
+Three documents describe this product, in this order:
+
+1. `docs/JEFF_BUILD_PLAN.md` — the base assistant: what Laya is, the fixture and parity method,
+   the safety critic, the phase 0–9 breakdown, the licence obligations. Still the reference for
+   the model and for packaging.
+2. This document — v2: the mid-sentence behaviour and the Siri-parity features. It is written
+   against the code as it stands today, and Part II exists so you do not rebuild what is already
+   working.
+3. `README.md` — how to build, install and run what exists right now.
+
+### Coverage map
+
+| JEFF plan phase | State today | Where v2 picks it up |
+| :-- | :-- | :-- |
+| 0 Environment and baseline | done — Xcode installed, `swift test` runs, cloud endpoints behind `DecisionEndpoint` | — |
+| 1 Oracle and fixtures | done — `tools/make_fixtures.py`, 410 golden records in `fixtures/laya_fixtures.jsonl` | — |
+| 2 Laya in MLX Swift | done — `PpMLX`, 100% top-1 parity on all 410 fixtures, mean 62 ms | — |
+| 3 Wire the loop | done — `PpDesktopApp.runCycles`, `StubProvider`, `HTTPProvider` | H instruments it |
+| 4 Streaming speech | partial — `SpeechInput` streams but has no `onPartial` callback | A adds the callback and the preemption |
+| 5 Wake word | partial — `WakeWordController` + `WakePhrase`, phrase battery in `check-desktop.sh` | B adds whisper handling and the dismissal phrase |
+| 6 Planner, sessions, safety | done — `GrammarPlanner`, `SessionStore`, `SafetyCritic`, `Verifier` | D, E, F add lanes |
+| 7 Memory and personalization | done — `LearningRecorder`, `MacroMiner`, `RankingFeatures`, `PersonalizationStore`, `EventLog` | F reuses it for learned skills |
+| 8 Adapters and plugins | **seams only** — `AdapterProtocol` (capabilities, fallback order), `PluginHost` (manifests, JSON-RPC) | E implements two browser adapters; the rest is deferred — see below |
+| 9 Packaging | mostly done — HF model links (`ModelSources`), installer, `BYOMPackageValidator`, `UpdateChannel`, `sign-and-notarize.sh` | I adds the missing plist keys and entitlements |
+| 7B Per-install LoRA | **seams only** — `TrainingTrace`, `AdapterPromotion` (promotion gate, rollback) | deferred — see below |
+
+### What is deliberately not in v2, and why
+
+**Phase 8, minus the browser lane.** Per-app adapters (WhatsApp, Zen workspaces, Shortcuts) are
+a day of selectors each, against apps that change their accessibility trees between releases. The
+only way to spend that time well is to work down the list in the order the accuracy suite fails,
+and that suite does not exist yet. The exception is the browser: row 4 of the contract needs a DOM
+index, so the CDP and extension adapters are pulled forward into Phase E. Everything else waits
+until the demo is filmable and the suite says which app hurts most.
+
+**Phase 7B, per-install fine-tuning.** This one is deferred for a different reason: it needs data
+that cannot exist yet. A LoRA trained on twenty traces overfits, and its promotion gate — "must
+improve replay accuracy and regress no blocking safety fixture" — cannot be evaluated before the
+replay and safety suites are real. What v2 does instead is the deterministic half of learning:
+macros, priors, learned skills. That half is cheap (under 20 ms), inspectable by the user, and
+cannot weaken a safety gate. The schema (`TrainingTrace`) and the promotion and rollback machinery
+(`AdapterPromotion`, `LoRAAdapterPackage`) are already in place, so the remaining work when you get
+there is the training loop itself and the choice of where it runs. Start it after the alpha has
+produced consented traces, not before.
+
+### If you only have a weekend
+
+Phase A, then Phase B.1. That is the demo: a partial transcript launches Notes before the sentence
+ends, and an island shows what happened. Do not start C, D or E before A works live, because
+everything else is ordinary feature work and A is the only part whose value depends on timing.
 
 ---
 

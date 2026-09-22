@@ -112,6 +112,14 @@ final class AppModel: ObservableObject {
     /// A deterministic command resolved while the user was still speaking. The target is
     /// known, so the only work left when the sentence closes is to do it.
     private var readyIntent: ReadyIntent?
+    private struct Preempted: Sendable {
+        let step: PlanStep
+        let clause: String
+        let at: Date
+        let appName: String
+    }
+    private var preemptionPolicy = PreemptionPolicy()
+    private var preempted: Preempted?
     /// What the fast path prepared. See `prepareFastPath`.
     private struct ReadyIntent {
         let intent: DirectIntent
@@ -128,6 +136,7 @@ final class AppModel: ObservableObject {
     private var commandObserver: NSObjectProtocol?
     private var settingsWindow: NSWindow?
     private var overlay: NSPanel?
+    private var islandController = IslandController()
     private var shortcutReady = false
 
     @Published var modelStatusMessage: String? = nil
@@ -239,10 +248,75 @@ final class AppModel: ObservableObject {
                 self.prewarm(clause)
             }
         }.store(in: &subscriptions)
+        speech.onPartial = { [weak self] partialText in
+            let t_asr = ProcessInfo.processInfo.systemUptime
+            guard let self, self.capturing, !self.waitingForWake else { return }
+            let observation = PartialObservation(
+                clause: partialText,
+                isFinal: false,
+                monotonicTime: t_asr
+            )
+            let decision = self.preemptionPolicy.observe(observation)
+            switch decision {
+            case .preempt(let step, let clause):
+                let t_decide = ProcessInfo.processInfo.systemUptime
+                self.headline = step.summary
+                self.detail = "Opening \(step.target ?? "app")…"
+                self.showOverlay()
+                self.memory.begin(clause: clause, app: step.target ?? "")
+                Task {
+                    let directRes = await self.performDirect(step)
+                    let t_act = ProcessInfo.processInfo.systemUptime
+                    let decideMs = Int((t_decide - t_asr) * 1000)
+                    let actMs = Int((t_act - t_decide) * 1000)
+                    let totalMs = Int((t_act - t_asr) * 1000)
+                    self.log.notice("timing: asr.partial -> preempt.decide (\(decideMs)ms) -> preempt.act (\(actMs)ms) = total \(totalMs)ms [\(clause, privacy: .public) -> \(directRes ?? "ok", privacy: .public)]")
+                    self.preempted = Preempted(step: step, clause: clause, at: Date(), appName: step.target ?? "")
+                    self.memory.record(
+                        step: step,
+                        label: step.target ?? "",
+                        kind: step.kind.rawValue,
+                        signature: step.summary,
+                        app: step.target ?? "",
+                        roles: [],
+                        succeeded: directRes != nil
+                    )
+                    self.memory.finish(succeeded: directRes != nil)
+                }
+            case .supersede(let step, let clause):
+                let t_decide = ProcessInfo.processInfo.systemUptime
+                self.headline = step.summary
+                self.detail = "Corrected to \(step.target ?? "app")…"
+                self.showOverlay()
+                self.memory.begin(clause: clause, app: step.target ?? "")
+                Task {
+                    let directRes = await self.performDirect(step)
+                    let t_act = ProcessInfo.processInfo.systemUptime
+                    let decideMs = Int((t_decide - t_asr) * 1000)
+                    let actMs = Int((t_act - t_decide) * 1000)
+                    let totalMs = Int((t_act - t_asr) * 1000)
+                    self.log.notice("timing: asr.partial -> supersede.decide (\(decideMs)ms) -> supersede.act (\(actMs)ms) = total \(totalMs)ms [\(clause, privacy: .public) -> \(directRes ?? "ok", privacy: .public)]")
+                    self.preempted = Preempted(step: step, clause: clause, at: Date(), appName: step.target ?? "")
+                    self.memory.record(
+                        step: step,
+                        label: step.target ?? "",
+                        kind: step.kind.rawValue,
+                        signature: step.summary,
+                        app: step.target ?? "",
+                        roles: [],
+                        succeeded: directRes != nil
+                    )
+                    self.memory.finish(succeeded: directRes != nil)
+                }
+            case .wait:
+                break
+            }
+        }
         speech.$status.sink { [weak self] status in
             if self?.capturing == true { self?.detail = status }
         }.store(in: &subscriptions)
         speech.onFinal = { [weak self] text in
+            let t_final_asr = ProcessInfo.processInfo.systemUptime
             guard let self, self.capturing, var target = self.target else { return }
             var text = text
             self.capturing = false
@@ -270,18 +344,75 @@ final class AppModel: ObservableObject {
                 self.waitingForWake = waiting
                 self.wakeModeAfterShortcut = nil
             }
+            if let dismissal = DismissalPhrase.match(text) {
+                switch dismissal {
+                case .cancel:
+                    self.cancel(showStatus: true)
+                    return
+                case .dismiss:
+                    self.dismissWidget()
+                    return
+                }
+            }
             if self.chainRunning {
                 self.pendingCommand = (text, target)
                 self.detail = "Queued: \(text)"
                 return
             }
-            // Acting on a partial transcript is never allowed, so the only thing a
-            // pre-read can do is save the first screen read when it still matches.
             let matched = self.preroute.take(ifMatching: text)
             let early = matched != nil && matched == self.prewarmed?.clause
                 && self.prewarmed?.pid == target.processIdentifier ? self.prewarmed?.snapshot : nil
             self.preroute.clear()
             self.prewarmed = nil
+
+            if let preempted = self.preempted {
+                self.preempted = nil
+                if let remainder = PreemptionPolicy.takeRemainder(full: text, consumed: preempted.clause) {
+                    let t_remainder = ProcessInfo.processInfo.systemUptime
+                    let remainderMs = Int((t_remainder - t_final_asr) * 1000)
+                    self.log.notice("timing: asr.final -> remainder.parse (\(remainderMs)ms) [remainder='\(remainder, privacy: .public)']")
+                    if remainder.isEmpty {
+                        // Empty remainder: report preempted result and finish without executing again
+                        self.headline = preempted.step.summary
+                        self.detail = "Done before you finished speaking."
+                        self.isBusy = false
+                        self.clearPixels()
+                        if self.handsFree { self.beginSpeech() }
+                        return
+                    } else {
+                        // Non-empty remainder: run against newly frontmost app resolved now
+                        let frontmostAppNow = Desktop.currentTarget(fallback: self.lastExternalApp) ?? target
+                        self.run(remainder, in: frontmostAppNow, started: self.releasedAt ?? Date(), firstSnapshot: nil)
+                        return
+                    }
+                } else {
+                    // Remainder was nil (malformed mid-word candidate) - do not execute through model
+                    self.headline = preempted.step.summary
+                    self.detail = "Done before you finished speaking."
+                    self.isBusy = false
+                    self.clearPixels()
+                    if self.handsFree { self.beginSpeech() }
+                    return
+                }
+            }
+
+            if let sysAction = SystemActionParser.parse(text) {
+                Task {
+                    do {
+                        let res = try await Desktop.executeSystemAction(sysAction)
+                        self.headline = res
+                        self.detail = "System command executed."
+                        self.isBusy = false
+                        self.clearPixels()
+                        self.showOverlay()
+                        if self.handsFree { self.beginSpeech() }
+                    } catch {
+                        self.fail(error.localizedDescription)
+                    }
+                }
+                return
+            }
+
             guard !self.runDirectIfReady(text) else { return }
             self.run(text, in: target, started: self.releasedAt ?? Date(), firstSnapshot: early)
         }
@@ -303,7 +434,10 @@ final class AppModel: ObservableObject {
         }
         hotKey.onCancel = { [weak self] in
             if self?.isBusy == true { self?.cancel() }
-            else { self?.overlay?.orderOut(nil) }
+            else {
+                self?.islandController.hide()
+                self?.overlay?.orderOut(nil)
+            }
         }
         do { try hotKey.register(); shortcutReady = true }
         catch {
@@ -626,6 +760,8 @@ final class AppModel: ObservableObject {
         timing = ""
         releasedAt = nil
         readyIntent = nil
+        preempted = nil
+        preemptionPolicy = PreemptionPolicy()
         headline = waitingForWake ? "Listening for “Hey pp” in the background" : "Listening…"
         if !waitingForWake { showOverlay() }
         let current = generation
@@ -689,6 +825,21 @@ final class AppModel: ObservableObject {
                     log.notice("act [\(wanted)] \(candidate.detail, privacy: .public) → \(result, privacy: .public)")
                     headline = result
                 } catch { log.notice("act [\(wanted)] failed: \(error.localizedDescription, privacy: .public)"); fail(error.localizedDescription) }
+            }
+            return
+        }
+        if let sysAction = SystemActionParser.parse(text) {
+            Task {
+                do {
+                    let res = try await Desktop.executeSystemAction(sysAction)
+                    self.headline = res
+                    self.detail = "System command executed."
+                    self.isBusy = false
+                    self.clearPixels()
+                    self.showOverlay()
+                } catch {
+                    self.fail(error.localizedDescription)
+                }
             }
             return
         }
@@ -1768,6 +1919,8 @@ final class AppModel: ObservableObject {
         preroute.clear()
         prewarmed = nil
         readyIntent = nil
+        preempted = nil
+        preemptionPolicy = PreemptionPolicy()
         handsFree = false
         waitingForWake = false
         wakeModeAfterShortcut = nil
@@ -1813,6 +1966,7 @@ final class AppModel: ObservableObject {
             window.center()
             settingsWindow = window
         }
+        islandController.hide()
         overlay?.orderOut(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
@@ -1838,15 +1992,38 @@ final class AppModel: ObservableObject {
     func dismissWidget() {
         if isBusy { cancel(showStatus: false) }
         systemAudio.stop()
+        islandController.hide()
         overlay?.orderOut(nil)
         if wakeWordEnabled { startWakeListening() }
     }
 
     private func showOverlay() {
+        // Update island state according to app status
+        let islandState: IslandState
+        if isBusy {
+            islandState = capturing ? .listening : .working
+        } else if headline == "Command stopped" || headline.contains("failed") || headline.contains("unavailable") {
+            islandState = .error(text: headline)
+        } else if !headline.isEmpty && headline != "Listening…" && headline != "Ready when you are" {
+            islandState = .result(text: headline)
+        } else {
+            islandState = .idle
+        }
+
+        islandController.onCancelRequested = { [weak self] in
+            self?.cancel(showStatus: true)
+        }
+        islandController.show(
+            state: islandState,
+            headline: headline,
+            detail: detail,
+            audioLevel: speech.isListening ? speech.audioLevel : 0.0
+        )
+
         if overlay == nil {
             let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 244, height: 202),
                                 styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-            panel.level = .floating
+            panel.level = .statusBar
             panel.isOpaque = false
             panel.backgroundColor = .clear
             panel.hasShadow = true
@@ -1869,6 +2046,7 @@ final class AppModel: ObservableObject {
         guard wakeWordEnabled, !isLoadingKey, setupComplete, !recordingShortcut else { return }
         if waitingForWake { return }
         cancel(showStatus: false)
+        islandController.hide()
         overlay?.orderOut(nil)
         systemAudio.stop()
         handsFree = true

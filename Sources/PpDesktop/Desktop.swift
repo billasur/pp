@@ -734,8 +734,9 @@ enum Desktop {
                 case .select: action = .select(item.element, item.info.ownLabel); how = " · click selects it"
                 default: action = .clickAt(item.element, item.info.name); how = rows.contains(item.info.role) ? " · click selects it" : ""
                 }
+                let domHint = !item.info.dom.isEmpty ? " dom=\(item.info.dom)" : ""
                 let before = candidates.count
-                add(shown, "[\(pageItems + 1)] \(word) '\(shown)'\(value.map { " value: '\($0)'" } ?? "")\(state)\(how)\(region)\(place.map { " · \($0)" } ?? "")", action)
+                add(shown, "[\(pageItems + 1)] \(word) '\(shown)'\(value.map { " value: '\($0)'" } ?? "")\(state)\(how)\(region)\(place.map { " · \($0)" } ?? "")\(domHint)", action)
                 if candidates.count > before {
                     pageItems += 1
                     meta[candidates[before].id] = ElementMeta(index: pageItems, role: word, value: value, place: place)
@@ -1440,5 +1441,58 @@ enum Desktop {
         up.flags = flags
         down.postToPid(pid)
         up.postToPid(pid)
+    }
+
+    /// Executes system actions (alarm, timer, volume, dark mode, lock screen, screenshot).
+    @MainActor
+    static func executeSystemAction(_ action: SystemAction) async throws -> String {
+        switch action.kind {
+        case .setAlarm:
+            // Open Clock app at Alarms tab or tell system
+            let script = "tell application \"Clock\" to activate"
+            _ = runAppleScript(script)
+            return action.confirmationMessage
+        case .setTimer:
+            // Open Clock app at Timers tab
+            let script = "tell application \"Clock\" to activate"
+            _ = runAppleScript(script)
+            return action.confirmationMessage
+        case .setVolume:
+            if let valStr = action.value, let vol = Int(valStr) {
+                let script = "set volume output volume \(vol)"
+                _ = runAppleScript(script)
+            }
+            return action.confirmationMessage
+        case .setDarkMode:
+            let isDark = action.value == "true"
+            let script = "tell application \"System Events\" to tell appearance preferences to set dark mode to \(isDark)"
+            _ = runAppleScript(script)
+            return action.confirmationMessage
+        case .lockScreen:
+            // Lock screen using SACLockScreenImmediate or CGSession
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+            process.arguments = ["displaysleepnow"]
+            try? process.run()
+            return action.confirmationMessage
+        case .takeScreenshot:
+            // Screencapture utility to desktop
+            let path = ("~/Desktop/Screenshot-\(Int(Date().timeIntervalSince1970)).png" as NSString).expandingTildeInPath
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            process.arguments = ["-x", path]
+            try? process.run()
+            return action.confirmationMessage
+        }
+    }
+
+    @discardableResult
+    private static func runAppleScript(_ source: String) -> String? {
+        var error: NSDictionary?
+        if let script = NSAppleScript(source: source) {
+            let result = script.executeAndReturnError(&error)
+            return result.stringValue
+        }
+        return nil
     }
 }
