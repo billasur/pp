@@ -9,7 +9,7 @@ import sys
 import tempfile
 
 os.umask(0o077)
-folder = Path.home() / "Library/Application Support/Jev Desktop/Signing"
+folder = Path.home() / "Library/Application Support/pp/Signing"
 folder.mkdir(parents=True, exist_ok=True, mode=0o700)
 keychain = folder / "signing.keychain-db"
 password_file = folder / "keychain-password"
@@ -33,12 +33,12 @@ try:
         old_search_list = shlex.split(run("security", "list-keychains", "-d", "user"))
         try:
             run("security", "create-keychain", "-p", password, str(keychain))
-            with tempfile.TemporaryDirectory(prefix="jev-signing-") as temporary:
+            with tempfile.TemporaryDirectory(prefix="pp-signing-") as temporary:
                 temp = Path(temporary)
                 private_key, certificate, archive = (temp / name for name in ("key.pem", "cert.pem", "identity.p12"))
                 run("/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256",
                     "-keyout", str(private_key), "-out", str(certificate), "-days", "3650",
-                    "-subj", "/CN=Jev Desktop Local Development/",
+                    "-subj", "/CN=pp Local Development/",
                     "-addext", "basicConstraints=critical,CA:FALSE",
                     "-addext", "keyUsage=critical,digitalSignature",
                     "-addext", "extendedKeyUsage=critical,codeSigning")
@@ -56,8 +56,13 @@ try:
     try:
         # codesign resolves the certificate chain through the search list even with --keychain.
         run("security", "list-keychains", "-d", "user", "-s", *old_search_list, str(keychain))
-        run("codesign", "--force", "--sign", identity_file.read_text(), "--keychain", str(keychain),
-            "--timestamp=none", "--identifier", "local.jev-use", sys.argv[1])
+        entitlements_path = Path("Resources/pp.entitlements")
+        cmd = ["codesign", "--force", "--sign", identity_file.read_text(), "--keychain", str(keychain),
+               "--timestamp=none", "--identifier", "local.pp"]
+        if entitlements_path.exists():
+            cmd.extend(["--entitlements", str(entitlements_path)])
+        cmd.append(sys.argv[1])
+        run(*cmd)
     finally:
         run("security", "list-keychains", "-d", "user", "-s", *old_search_list)
     run("codesign", "--verify", "--strict", sys.argv[1])

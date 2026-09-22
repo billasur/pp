@@ -2,3 +2,8 @@
 build/
 .DS_Store
 .env
+.swiftpm/
+*.safetensors
+
+__pycache__/
+*.pyc

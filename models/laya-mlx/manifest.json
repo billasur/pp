@@ -1,0 +1,26 @@
+{
+  "manifest_version": "1.0.0",
+  "model_id": "convaiinnovations/laya",
+  "package_name": "laya-421m-mlx",
+  "precision": "float16",
+  "format": "safetensors",
+  "min_pp_version": "1.0.0",
+  "files": {
+    "model.safetensors": {
+      "size_bytes": 842607860,
+      "sha256": "67d2ba2c159e2417a40fe0aef080120fa06f49c5f41b773261a934c9a76ccc28"
+    },
+    "config.json": {
+      "size_bytes": 1881,
+      "sha256": "d715c2f08bb168c073be17017450c186f9a2e333177e7cb9be35fd2e95f1935c"
+    },
+    "tokenizer.json": {
+      "size_bytes": 3583228,
+      "sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30"
+    },
+    "tokenizer_config.json": {
+      "size_bytes": 308,
+      "sha256": "50044de60daaa73df97d262e15a40d4faf0160e7d742df64b377877a1320dd12"
+    }
+  }
+}

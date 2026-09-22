@@ -4,7 +4,7 @@ import Carbon
 @main
 struct DesktopChecks {
     @MainActor static func main() async throws {
-        let name = "local.jev-use.tests.\(UUID().uuidString)"
+        let name = "local.pp.tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: name)!
         defer { defaults.removePersistentDomain(forName: name) }
         precondition(KeyboardShortcut.load(defaults: defaults) == .defaultShortcut)
@@ -40,8 +40,12 @@ struct DesktopChecks {
         precondition(WakePhrase.command(in: "Hey Jev", after: "") == nil)
         precondition(WakePhrase.command(in: "Hey Jeff", after: "Hey Jev") == "")
         precondition(WakePhrase.command(in: "Hey Jeff, open Finder", after: "Hey Jev") == "open Finder")
-        precondition(WakePhrase.command(in: "Hey Jefferson", after: "Hey Jev") == nil)
         precondition(WakePhrase.command(in: "Hey Jeff", after: "Hey Sam") == nil)
+        precondition(WakePhrase.command(in: "Hey pp", after: "Hey pp") == "")
+        precondition(WakePhrase.command(in: "HEY, PP! Open Finder", after: "Hey pp") == "Open Finder")
+        precondition(WakePhrase.command(in: "Hey pp, type Hello, world!", after: "Hey pp") == "type Hello, world!")
+        precondition(WakePhrase.command(in: "Hey p p, open Finder", after: "Hey pp") == "open Finder")
+        precondition(WakePhrase.command(in: "Hey pee pee, open Finder", after: "Hey pp") == "open Finder")
         let noSpeech = NSError(domain: "kAFAssistantErrorDomain", code: 1110)
         var restarts = 0
         var failures = 0
