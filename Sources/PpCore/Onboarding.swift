@@ -5,12 +5,18 @@ public enum PermissionKind: String, Sendable, CaseIterable {
     case accessibility
     case microphone
     case speechRecognition
+    case appleEvents
+    case calendars
+    case notifications
 
     public var title: String {
         switch self {
         case .accessibility: return "Accessibility"
         case .microphone: return "Microphone"
         case .speechRecognition: return "Speech recognition"
+        case .appleEvents: return "Automation (Apple Events)"
+        case .calendars: return "Calendars"
+        case .notifications: return "Notifications"
         }
     }
 
@@ -22,6 +28,12 @@ public enum PermissionKind: String, Sendable, CaseIterable {
             return "pp listens only while you hold the shortcut or after you say the wake phrase."
         case .speechRecognition:
             return "Your speech is transcribed on this Mac. pp never sends audio anywhere."
+        case .appleEvents:
+            return "pp controls system settings and apps (Finder, Music, System Settings) through Apple Events."
+        case .calendars:
+            return "pp accesses your calendar to check upcoming events and reminders."
+        case .notifications:
+            return "pp delivers timely alarms and timers when they fire, even if pp is not frontmost."
         }
     }
 
@@ -34,6 +46,12 @@ public enum PermissionKind: String, Sendable, CaseIterable {
             return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!
         case .speechRecognition:
             return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition")!
+        case .appleEvents:
+            return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!
+        case .calendars:
+            return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars")!
+        case .notifications:
+            return URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!
         }
     }
 }

@@ -45,6 +45,16 @@ public final class EnergyEOU: EndOfUtteranceDetecting, @unchecked Sendable {
             self.silenceDurationSeconds = silenceDurationSeconds
             self.speechLeadDurationSeconds = speechLeadDurationSeconds
         }
+
+        public static let wakePhase = Config(
+            silenceDurationSeconds: 0.6,
+            speechLeadDurationSeconds: 0.15
+        )
+
+        public static let sessionPhase = Config(
+            silenceDurationSeconds: 1.0,
+            speechLeadDurationSeconds: 0.15
+        )
     }
 
     public let config: Config

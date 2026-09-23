@@ -21,5 +21,6 @@
     <key>NSAppleEventsUsageDescription</key><string>Control macOS system settings and automate supported applications like Clock, Finder, and System Events.</string>
     <key>NSCalendarsUsageDescription</key><string>Create and read reminder events scheduled by voice.</string>
     <key>NSRemindersUsageDescription</key><string>Create and complete reminders scheduled by voice.</string>
+    <key>NSContactsUsageDescription</key><string>Resolve contact names when sending messages via voice.</string>
 </dict>
 </plist>

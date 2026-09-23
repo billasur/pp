@@ -1,6 +1,9 @@
 import Foundation
 import AVFoundation
 import Speech
+import UserNotifications
+import EventKit
+import AppKit
 import PpCore
 import os
 
@@ -202,6 +205,40 @@ struct MacPermissionProbe: PermissionProbing {
             case .notDetermined: return .notDetermined
             default: return .denied
             }
+        case .appleEvents:
+            // Check Apple Events automation status via AEDeterminePermissionToAutomateTarget
+            let targetAEDesc: NSAppleEventDescriptor
+            if #available(macOS 11.0, *) {
+                targetAEDesc = NSAppleEventDescriptor(bundleIdentifier: "com.apple.finder")
+            } else {
+                targetAEDesc = NSAppleEventDescriptor()
+            }
+            let status = AEDeterminePermissionToAutomateTarget(targetAEDesc.aeDesc, typeWildCard, typeWildCard, false)
+            switch status {
+            case noErr: return .granted
+            case OSStatus(errAEEventNotPermitted): return .denied
+            default: return .notDetermined
+            }
+        case .calendars:
+            let status = EKEventStore.authorizationStatus(for: .event)
+            switch status {
+            case .authorized, .fullAccess: return .granted
+            case .notDetermined: return .notDetermined
+            default: return .denied
+            }
+        case .notifications:
+            let semaphore = DispatchSemaphore(value: 0)
+            var grantedStatus: PermissionStatus = .notDetermined
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                switch settings.authorizationStatus {
+                case .authorized, .provisional: grantedStatus = .granted
+                case .notDetermined: grantedStatus = .notDetermined
+                default: grantedStatus = .denied
+                }
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 0.2)
+            return grantedStatus
         }
     }
 
@@ -210,6 +247,18 @@ struct MacPermissionProbe: PermissionProbing {
         case .accessibility: Desktop.requestAccess()
         case .microphone: AVCaptureDevice.requestAccess(for: .audio) { _ in }
         case .speechRecognition: SFSpeechRecognizer.requestAuthorization { _ in }
+        case .appleEvents:
+            let targetAEDesc = NSAppleEventDescriptor(bundleIdentifier: "com.apple.finder")
+            _ = AEDeterminePermissionToAutomateTarget(targetAEDesc.aeDesc, typeWildCard, typeWildCard, true)
+        case .calendars:
+            let store = EKEventStore()
+            if #available(macOS 14.0, *) {
+                store.requestFullAccessToEvents { _, _ in }
+            } else {
+                store.requestAccess(to: .event) { _, _ in }
+            }
+        case .notifications:
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
     }
 }

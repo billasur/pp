@@ -30,8 +30,14 @@ struct VoiceChecks {
         let remainder = PreemptionPolicy.takeRemainder(full: fullTranscript, consumed: clause)
         assert(remainder == "write down meeting notes", "Remainder must be stripped of connectors")
 
-        print("timing: asr.partial -> preempt.decide (2ms) -> preempt.act (180ms) = total 182ms (<500ms target)")
-        print("timing: asr.final -> remainder.parse (1ms) -> run in frontmost app")
+        let fullTranscriptCap = "open notes and write Sumit's number"
+        let remainderCap = PreemptionPolicy.takeRemainder(full: fullTranscriptCap, consumed: clause)
+        assert(remainderCap == "write Sumit's number", "Remainder must preserve original capitalization")
+
+        let tDecideDelta = (t2 - t1) * 1000.0
+        print("Preemption policy verified in \(String(format: "%.1f", tDecideDelta))ms simulated stream")
+        print("timing: asr.partial -> preempt.decide -> preempt.act (real marks collected via Timing actor)")
+        print("timing: asr.final -> remainder.parse -> frontmost app")
 
         // 2. Whispered wake phrase check
         let wake = WakePhrase.command(in: "ey pp, open safari", after: "Hey pp")

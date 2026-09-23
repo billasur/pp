@@ -1,0 +1,19 @@
+{"input": "hey pp open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "ey pp open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "heipp open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "heypp open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "hey p p open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "hey pee pee open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "a pp open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "hey bee open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "hey papa open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "okay hey pp open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "um so hey pp open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "pp open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "p p open zen", "expected_wake": true, "expected_command": "open zen"}
+{"input": "hey pp search youtube.com", "expected_wake": true, "expected_command": "search youtube.com"}
+{"input": "hey pp set an alarm for seven thirty", "expected_wake": true, "expected_command": "set an alarm for seven thirty"}
+{"input": "hey pp whatsapp diya", "expected_wake": true, "expected_command": "whatsapp diya"}
+{"input": "hey buddy", "expected_wake": false, "expected_command": null}
+{"input": "open pp", "expected_wake": false, "expected_command": null}
+{"input": "heyyy", "expected_wake": false, "expected_command": null}

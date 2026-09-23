@@ -57,6 +57,14 @@ codesign --force --deep --options runtime --timestamp \
 
 codesign --verify --deep --strict --verbose=2 "$APP"
 
+# Assert Apple Events automation entitlement is present
+echo "Checking entitlements for com.apple.security.automation.apple-events…"
+ENTITLEMENT_DUMP="$(codesign -d --entitlements :- "$APP" 2>&1)"
+if ! echo "$ENTITLEMENT_DUMP" | grep -q "com.apple.security.automation.apple-events"; then
+  echo "error: missing required com.apple.security.automation.apple-events entitlement!" >&2
+  exit 1
+fi
+
 # The DMG is what gets shipped, so it is signed too.
 if [[ -f "$DMG" ]]; then
   codesign --force --timestamp --sign "$IDENTITY" "$DMG"

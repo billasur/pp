@@ -23,36 +23,48 @@ public enum WakePhrase {
         let spoken = words(utterance)
         guard !expected.isEmpty, !spoken.isEmpty else { return nil }
         let expectedWords = expected.map { $0.0 }
-
-        // Exact prefix match
-        if spoken.count >= expected.count {
-            let spokenPrefix = Array(spoken.prefix(expected.count).map { $0.0 })
-            let recognizedVariant = (expectedWords == ["hey", "jev"] && spokenPrefix == ["hey", "jeff"])
-                || (expectedWords == ["hey", "pp"] && spokenPrefix == ["ey", "pp"])
-            if spokenPrefix == expectedWords || recognizedVariant {
-                let end = spoken[expected.count - 1].1.upperBound
-                return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowedFillers: Set<String> = ["ok", "okay", "um", "so", "ah"]
+        let maxStartIndex = min(4, spoken.count)
+        for i in 0..<maxStartIndex {
+            if i > 0 {
+                let leadWords = (0..<i).map { spoken[$0].0 }
+                if !leadWords.allSatisfy({ allowedFillers.contains($0) }) {
+                    continue
+                }
             }
-        }
+            let slice = spoken[i...]
+            let sliceWords = slice.map { $0.0 }
 
-        // Handle phonetic split variants for "hey pp" -> "hey p p", "hey pee pee", "ey p p", "ey pee pee"
-        if expectedWords == ["hey", "pp"] && spoken.count >= 3 {
-            let threePrefix = Array(spoken.prefix(3).map { $0.0 })
-            if threePrefix == ["hey", "p", "p"] || threePrefix == ["hey", "pee", "pee"]
-                || threePrefix == ["ey", "p", "p"] || threePrefix == ["ey", "pee", "pee"] {
-                let end = spoken[2].1.upperBound
-                return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
+            // Exact prefix match
+            if sliceWords.count >= expected.count {
+                let spokenPrefix = Array(sliceWords.prefix(expected.count))
+                let recognizedVariant = (expectedWords == ["hey", "jev"] && spokenPrefix == ["hey", "jeff"])
+                    || (expectedWords == ["hey", "pp"] && spokenPrefix == ["ey", "pp"])
+                if spokenPrefix == expectedWords || recognizedVariant {
+                    let end = slice[slice.startIndex + expected.count - 1].1.upperBound
+                    return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
             }
-        }
 
-        // Whispered / quiet bare wake: "pp, open Finder" or "p p, open Finder"
-        if expectedWords == ["hey", "pp"] && spoken.count >= 1 {
-            if spoken[0].0 == "pp" {
-                let end = spoken[0].1.upperBound
-                return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
-            } else if spoken.count >= 2 && spoken[0].0 == "p" && spoken[1].0 == "p" {
-                let end = spoken[1].1.upperBound
-                return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
+            // Handle phonetic split variants for "hey pp" -> "hey p p", "hey pee pee", "ey p p", "ey pee pee"
+            if expectedWords == ["hey", "pp"] && sliceWords.count >= 3 {
+                let threePrefix = Array(sliceWords.prefix(3))
+                if threePrefix == ["hey", "p", "p"] || threePrefix == ["hey", "pee", "pee"]
+                    || threePrefix == ["ey", "p", "p"] || threePrefix == ["ey", "pee", "pee"] {
+                    let end = slice[slice.startIndex + 2].1.upperBound
+                    return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+
+            // Whispered / quiet bare wake at start of utterance: "pp, open Finder" or "p p, open Finder"
+            if i == 0 && expectedWords == ["hey", "pp"] && sliceWords.count >= 1 {
+                if sliceWords[0] == "pp" {
+                    let end = slice[slice.startIndex].1.upperBound
+                    return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
+                } else if sliceWords.count >= 2 && sliceWords[0] == "p" && sliceWords[1] == "p" {
+                    let end = slice[slice.startIndex + 1].1.upperBound
+                    return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
             }
         }
 

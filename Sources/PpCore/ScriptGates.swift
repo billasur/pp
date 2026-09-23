@@ -79,22 +79,51 @@ public enum ScriptGates {
         return .failure(.noEffect("Script contains no action or effect commands."))
     }
 
-    /// Gate 3: Policy check. Blocklists sensitive system paths, shell commands, and destructive actions.
+    /// Gate 3: Policy check. Blocklists sensitive system paths, bans shell scripts, and runs against decompile output.
     public static func checkPolicy(source: String) -> Result<Void, ScriptGateError> {
+        // Cap script length
+        if source.count > 2000 {
+            return .failure(.policyViolation("Script exceeds maximum allowable length of 2000 characters."))
+        }
+
         let lowered = source.lowercased()
+
+        // Unconditionally ban shell scripts in v2.1
+        if lowered.contains("do shell script") {
+            var details = ["Execution of shell scripts ('do shell script') is strictly forbidden."]
+            let shellBlocked = ["rm ", "rm -rf", "rmdir", "curl", "chmod", "chown", "wget", "kill", "eval", "sh", "bash", "zsh"]
+            for bad in shellBlocked {
+                if lowered.contains(bad) {
+                    details.append("Shell command contains dangerous utility ('\(bad)').")
+                }
+            }
+            let blockedSubstrings = ["/system", "/library", "/usr", "/bin", "/sbin", "~/.ssh", ".ssh", ".env", "keychain", "terminal", "iterm", "sudo", "launchctl", "defaults delete", "osascript"]
+            for blocked in blockedSubstrings {
+                if lowered.contains(blocked) {
+                    details.append("Script touches protected target or command ('\(blocked)').")
+                }
+            }
+            return .failure(.policyViolation(details.joined(separator: " ")))
+        }
 
         let blockedSubstrings = [
             "/system",
             "/library",
+            "/usr",
+            "/bin",
+            "/sbin",
             "~/.ssh",
-            ".ssh/",
+            ".ssh",
             ".env",
             "keychain",
             "terminal",
+            "iterm",
             "sudo",
             "launchctl",
             "defaults delete",
-            "osascript"
+            "osascript",
+            "curl",
+            "wget"
         ]
 
         for blocked in blockedSubstrings {
@@ -103,12 +132,31 @@ public enum ScriptGates {
             }
         }
 
-        // Shell script execution restrictions
-        if lowered.contains("do shell script") {
-            let shellBlocked = ["rm ", "rmdir", "curl", "chmod", "chown", "wget", "kill", "eval", "sh", "bash", "zsh"]
-            for bad in shellBlocked {
-                if lowered.contains(bad) {
-                    return .failure(.policyViolation("Shell command contains dangerous utility ('\(bad)')."))
+        // Compile and decompile to inspect resolved string literals preventing concatenation bypasses
+        let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("pp_check_\(UUID().uuidString).scpt")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let compileProcess = Process()
+        compileProcess.executableURL = URL(fileURLWithPath: "/usr/bin/osacompile")
+        compileProcess.arguments = ["-e", source, "-o", tempURL.path]
+        try? compileProcess.run()
+        compileProcess.waitUntilExit()
+
+        if compileProcess.terminationStatus == 0 {
+            let decompileProcess = Process()
+            let pipe = Pipe()
+            decompileProcess.executableURL = URL(fileURLWithPath: "/usr/bin/osadecompile")
+            decompileProcess.arguments = [tempURL.path]
+            decompileProcess.standardOutput = pipe
+            try? decompileProcess.run()
+            decompileProcess.waitUntilExit()
+
+            let decompiledData = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let decompiled = String(data: decompiledData, encoding: .utf8)?.lowercased() {
+                for blocked in blockedSubstrings {
+                    if decompiled.contains(blocked) {
+                        return .failure(.policyViolation("Compiled script resolves to protected target ('\(blocked)')."))
+                    }
                 }
             }
         }
@@ -124,8 +172,8 @@ public enum ScriptGates {
         return .failure(.verificationFailed("P(script achieves goal) = \(probability) < \(threshold)"))
     }
 
-    /// Evaluates all 4 gates in order.
-    public static func evaluateAll(source: String, probability: Double = 1.0) -> Result<Void, ScriptGateError> {
+    /// Evaluates all 4 gates in order. Requires explicit probability score.
+    public static func evaluateAll(source: String, probability: Double) -> Result<Void, ScriptGateError> {
         switch checkCompile(source: source) {
         case .failure(let err): return .failure(err)
         case .success: break

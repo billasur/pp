@@ -45,6 +45,35 @@ public enum DOMIndexer {
             self.autocomplete = autocomplete
             self.isPaymentOrCardDescendant = isPaymentOrCardDescendant
         }
+
+        /// Secondary initializer parsing dictionaries from CDP evaluate or Native Messaging JSON payloads.
+        public init?(dictionary: [String: Any]) {
+            guard let id = dictionary["id"] as? String ?? (dictionary["backendNodeId"] as? Int).map(String.init) ?? (dictionary["nodeId"] as? Int).map(String.init),
+                  let tag = dictionary["tag"] as? String ?? dictionary["nodeName"] as? String else {
+                return nil
+            }
+            self.id = id
+            self.tag = tag.lowercased()
+            self.role = dictionary["role"] as? String
+            self.accessibleName = dictionary["accessibleName"] as? String ?? dictionary["name"] as? String
+            self.placeholder = dictionary["placeholder"] as? String
+            self.textContent = dictionary["textContent"] as? String ?? dictionary["value"] as? String
+            self.isVisible = dictionary["isVisible"] as? Bool ?? true
+            self.isInteractive = dictionary["isInteractive"] as? Bool ?? true
+
+            var parsedRect: CGRect = .zero
+            if let rectDict = dictionary["rect"] as? [String: Any] {
+                let x = (rectDict["x"] as? Double) ?? (rectDict["left"] as? Double) ?? 0.0
+                let y = (rectDict["y"] as? Double) ?? (rectDict["top"] as? Double) ?? 0.0
+                let w = (rectDict["width"] as? Double) ?? (rectDict["w"] as? Double) ?? 0.0
+                let h = (rectDict["height"] as? Double) ?? (rectDict["h"] as? Double) ?? 0.0
+                parsedRect = CGRect(x: x, y: y, width: w, height: h)
+            }
+            self.rect = parsedRect
+            self.inputType = dictionary["inputType"] as? String ?? dictionary["type"] as? String
+            self.autocomplete = dictionary["autocomplete"] as? String
+            self.isPaymentOrCardDescendant = dictionary["isPaymentOrCardDescendant"] as? Bool ?? false
+        }
     }
 
     public struct IndexResult: Equatable, Sendable {

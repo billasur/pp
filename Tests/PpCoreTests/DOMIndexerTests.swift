@@ -69,4 +69,53 @@ final class DOMIndexerTests: XCTestCase {
         XCTAssertTrue(result.indexedWireString.contains("label=\"Documentation\""))
         XCTAssertTrue(result.indexedWireString.contains("label=\"Search\""))
     }
+
+    func testDualTransportParityAndOpaquePaymentIframe() {
+        // Shared fixture: CDP dictionary and Extension dictionary representing same DOM
+        let cdpDict: [String: Any] = [
+            "id": "link-1",
+            "tag": "a",
+            "role": "link",
+            "accessibleName": "Documentation",
+            "rect": ["x": 10.0, "y": 20.0, "width": 80.0, "height": 25.0],
+            "isVisible": true,
+            "isInteractive": true
+        ]
+        let extDict: [String: Any] = [
+            "backendNodeId": 1,
+            "nodeName": "A",
+            "role": "link",
+            "name": "Documentation",
+            "rect": ["left": 10.0, "top": 20.0, "w": 80.0, "h": 25.0],
+            "isVisible": true,
+            "isInteractive": true
+        ]
+
+        let cdpInput = DOMIndexer.DOMElementInput(dictionary: cdpDict)!
+        let extInput = DOMIndexer.DOMElementInput(dictionary: extDict)!
+
+        let cdpIndex = DOMIndexer.index(elements: [cdpInput])
+        let extIndex = DOMIndexer.index(elements: [extInput])
+
+        XCTAssertEqual(cdpIndex.candidates.count, 1)
+        XCTAssertEqual(extIndex.candidates.count, 1)
+        XCTAssertEqual(cdpIndex.candidates[0].label, extIndex.candidates[0].label)
+        XCTAssertEqual(cdpIndex.candidates[0].role, extIndex.candidates[0].role)
+
+        // Privacy: verify payment iframe and autocomplete=cc-* are unconditionally opaque
+        let paymentIframeDict: [String: Any] = [
+            "id": "iframe-payment",
+            "tag": "iframe",
+            "role": "region",
+            "accessibleName": "Stripe Payment Element",
+            "isPaymentOrCardDescendant": true,
+            "isVisible": true,
+            "isInteractive": true
+        ]
+        let paymentInput = DOMIndexer.DOMElementInput(dictionary: paymentIframeDict)!
+        let paymentIndex = DOMIndexer.index(elements: [paymentInput])
+
+        XCTAssertTrue(paymentIndex.opaqueElementIDs.contains("iframe-payment"))
+        XCTAssertTrue(paymentIndex.candidates.isEmpty, "Payment iframe must never appear in candidate list")
+    }
 }

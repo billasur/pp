@@ -85,8 +85,41 @@ struct DesktopChecks {
         precondition(policy.observe(PartialObservation(clause: "open notes", isFinal: false, monotonicTime: 0.1)) == .wait) // 1st stable
         let decision = policy.observe(PartialObservation(clause: "open notes", isFinal: false, monotonicTime: 0.2)) // 2nd stable
         precondition(decision == .preempt(step: PlanStep(kind: .openApp, target: "notes"), clause: "open notes"))
+        // Scripted partial stream proving cooldown:
+        let obsCooldown1 = PartialObservation(clause: "open safari", isFinal: false, monotonicTime: 0.5) // inside 1.5s cooldown
+        precondition(policy.observe(obsCooldown1) == .wait, "Cooldown must block repeated launch inside 1.5s")
+        let obsCooldown2 = PartialObservation(clause: "open safari", isFinal: false, monotonicTime: 2.0) // after 1.5s cooldown
+        precondition(policy.observe(obsCooldown2) == .supersede(step: PlanStep(kind: .openApp, target: "safari"), clause: "open safari"), "Supersede allowed after cooldown")
+
         precondition(PreemptionPolicy.takeRemainder(full: "open notes and write down hello", consumed: "open notes") == "write down hello")
+        precondition(PreemptionPolicy.takeRemainder(full: "open notes and write Sumit's number", consumed: "open notes") == "write Sumit's number")
         precondition(PreemptionPolicy.takeRemainder(full: "open notesapp", consumed: "open notes") == nil) // Mid-word safety returns nil
-        print("Desktop checks passed, including repeated silence recovery, cancellation during recovery, preservation of real errors, and preemption policy.")
+
+        // Scripted WakeSession partial stream: wake, pause, three clauses, dismissal -> 3 executions, 1 close
+        var multiSession = WakeSession(initialPhase: .wakeListening)
+        var executedClauses: [String] = []
+        var sessionClosed = false
+
+        let wakeOutcome = multiSession.ingest(partial: "hey pp", at: 1.0)
+        precondition(wakeOutcome == .woke(command: ""))
+        precondition(multiSession.clauseCompleted("hey pp", at: 1.2) == .none)
+        precondition(multiSession.phase == .session)
+
+        _ = multiSession.ingest(partial: "open zen", at: 3.0)
+        if case .execute(let cmd) = multiSession.clauseCompleted("open zen", at: 3.5) { executedClauses.append(cmd) }
+
+        _ = multiSession.ingest(partial: "open youtube.com", at: 5.0)
+        if case .execute(let cmd) = multiSession.clauseCompleted("open youtube.com", at: 5.5) { executedClauses.append(cmd) }
+
+        _ = multiSession.ingest(partial: "search youtube for lofi beats", at: 7.0)
+        if case .execute(let cmd) = multiSession.clauseCompleted("search youtube for lofi beats", at: 7.5) { executedClauses.append(cmd) }
+
+        let actionClose = multiSession.clauseCompleted("bye", at: 9.0)
+        if case .close = actionClose { sessionClosed = true }
+
+        precondition(executedClauses == ["open zen", "open youtube.com", "search youtube for lofi beats"])
+        precondition(sessionClosed && multiSession.phase == .closing)
+
+        print("Desktop checks passed, including repeated silence recovery, cancellation during recovery, preservation of real errors, preemption policy, and multi-clause wake session.")
     }
 }

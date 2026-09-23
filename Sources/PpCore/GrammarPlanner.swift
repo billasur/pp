@@ -92,8 +92,23 @@ public enum GrammarPlanner {
         let trimmed = clause.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = trimmed.lowercased()
 
-        // 1. Search commands ("search for X", "google X")
-        if let searchMatch = matchPrefix(lower, prefixes: ["search for ", "search ", "google "]) {
+        // 1. Web & Search commands via WebIntent
+        let webIntent = WebIntentParser.parse(clause)
+        if case .search(let query, _) = webIntent, let url = webIntent.url {
+            return [
+                PlanStep(kind: .openURL, target: url.absoluteString),
+                PlanStep(kind: .focusInput, target: "Search input"),
+                PlanStep(kind: .typeText, target: "Search input", text: query)
+            ]
+        } else if case .openSite = webIntent, let url = webIntent.url {
+            return [
+                PlanStep(kind: .openURL, target: url.absoluteString)
+            ]
+        } else if case .play = webIntent, let url = webIntent.url {
+            return [
+                PlanStep(kind: .openURL, target: url.absoluteString)
+            ]
+        } else if let searchMatch = matchPrefix(lower, prefixes: ["search for ", "search ", "google "]) {
             let query = String(trimmed.dropFirst(searchMatch.count)).trimmingCharacters(in: .whitespacesAndNewlines)
             return [
                 PlanStep(kind: .openURL, target: "https://www.google.com/search?q=\(query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query)"),
@@ -239,5 +254,21 @@ public enum GrammarPlanner {
             return trimmed
         }
         return "https://" + trimmed
+    }
+
+    public static func isGrammarCommand(_ text: String) -> Bool {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let prefixes = [
+            "run ", "go to ", "visit ", "browse to ",
+            "open ", "launch ", "start ", "switch to ",
+            "type ", "enter ", "write ", "input ",
+            "press ", "hit ",
+            "quit ", "close app ", "exit ",
+            "scroll ", "click on ", "click ", "tap on ", "tap ",
+            "search ", "google "
+        ]
+        if prefixes.contains(where: { clean.hasPrefix($0) }) { return true }
+        let exact = ["close window", "close the window", "new tab", "open a new tab", "save", "save file", "save it", "copy", "paste"]
+        return exact.contains(clean)
     }
 }

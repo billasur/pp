@@ -13,6 +13,10 @@ swiftc -parse-as-library \
   Sources/PpCore/PreemptionPolicy.swift \
   Sources/PpCore/SystemAction.swift \
   Sources/PpCore/ScriptGates.swift \
+  Sources/PpCore/AppAliases.swift \
+  Sources/PpCore/SiteTable.swift \
+  Sources/PpCore/WebIntent.swift \
+  Sources/PpCore/Preferences.swift \
   Tests/VoiceChecks/main.swift \
   -o "$CHECK_DIR/check-voice"
 "$CHECK_DIR/check-voice"

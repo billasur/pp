@@ -10,6 +10,16 @@ public enum SystemActionKind: String, Codable, CaseIterable, Sendable {
     case takeScreenshot = "take_screenshot"
 }
 
+public struct SystemActionResult: Equatable, Sendable {
+    public let verified: Bool
+    public let message: String
+
+    public init(verified: Bool, message: String) {
+        self.verified = verified
+        self.message = message
+    }
+}
+
 public struct SystemAction: Equatable, Sendable {
     public let kind: SystemActionKind
     public let value: String?

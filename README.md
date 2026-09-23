@@ -25,6 +25,7 @@ You speak or type what you want; `pp` reads the current screen state through the
 ## Status and plans
 
 - [docs/V2_PLAN.md](docs/V2_PLAN.md) — the v2 design: mid-sentence preemption, the island, alarms, the system lane, the browser lane, script synthesis behind four gates.
+- [docs/V3_PLAN.md](docs/V3_PLAN.md) — the next pass from real use: one wake then a continuous session, hearing fixes, the web lane, WhatsApp, alarms that ring, and the notch-split island, with a prompt pack for each task.
 - [docs/V2_SWOT.md](docs/V2_SWOT.md) — what in v2 is verified against the code, what only looks verified, and where the leverage is.
 - [docs/V2_NEXT.md](docs/V2_NEXT.md) — the next pass, track by track and file by file, with exit gates.
 - [docs/JEFF_BUILD_PLAN.md](docs/JEFF_BUILD_PLAN.md) — the reference for the model, the fixture method and packaging.

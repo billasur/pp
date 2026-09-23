@@ -36,3 +36,16 @@ Reviewer checklist for pp v2 releases. Every gate is verified by automated tests
 - Microphone closes within one buffer when dismissed or cancelled.
 - Planner defaults to local grammar and local MLX models. External network calls require explicit user-configured endpoints.
 - Verified by: `Tests/PpCoreTests/NoCloudTests.swift`, `Tests/PpCoreTests/WakeWordControllerTests.swift` (`testKillSwitchStopsCaptureWithinOneBuffer`).
+
+## Invariant 7: Every state change requires read-back verification
+- No system action or alarm may report success without verifying that the requested state change took effect.
+- Volume, dark mode, screenshots, and alarms read back their state; unverified actions report failure.
+- Clock.app activations without scheduled items are explicitly forbidden and treated as unverified.
+- Verified by: `Tests/PpCoreTests/SystemActionTests.swift` (`testSystemActionResultVerification`), `Sources/PpDesktop/SystemExecutor.swift`.
+
+## Invariant 8: Proposer never inspects page text
+- Script synthesizers and action proposers receive only the high-level user goal and the frontmost application identifier.
+- Page text, web DOM, and on-screen document contents are excluded from synthesis prompts to prevent prompt injection from untrusted web pages.
+- Synthesized AppleScripts must pass the 4-gate verification pipeline (`ScriptGates`) and cannot execute shell scripts (`do shell script` is banned).
+- Verified by: `Tests/PpCoreTests/AdversarialSafetyTests.swift`, `Sources/PpCore/ScriptGates.swift`.
+

@@ -4,6 +4,9 @@ import Combine
 import Foundation
 import Speech
 import os
+#if canImport(PpCore)
+import PpCore
+#endif
 
 @MainActor
 final class SpeechInput: ObservableObject {
@@ -18,13 +21,16 @@ final class SpeechInput: ObservableObject {
     var onFailure: ((String) -> Void)?
 
     private var handsFree = false
+    private var isSessionMode = false
+    private var sessionVocabulary: [String] = []
+    private var ringBuffer = AudioRingBuffer(capacitySeconds: 2.0)
     private var silenceTask: Task<Void, Never>?
     private var sessionTask: Task<Void, Never>?
     private var finalTask: Task<Void, Never>?
 
     private let engine = AVAudioEngine()
     private let recognizer = SFSpeechRecognizer()
-    private let eouDetector = EnergyEOU()
+    private var eouDetector = EnergyEOU()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private var audioGate: OSAllocatedUnfairLock<Bool>?
@@ -100,8 +106,16 @@ final class SpeechInput: ObservableObject {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
-        if let wakePhrase { request.contextualStrings = [wakePhrase] }
-        if recognizer.supportsOnDeviceRecognition {
+        if #available(macOS 13, *) {
+            request.addsPunctuation = false
+        }
+        request.contextualStrings = SpeechVocabulary.shared.commandStrings()
+
+        let mode = RecognitionSettings.shared.mode
+        if mode == .preferAppleServers {
+            request.requiresOnDeviceRecognition = false
+            recognitionMode = "Apple Servers"
+        } else if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
             recognitionMode = "Apple Neural Engine (100% offline)"
         } else {
@@ -111,16 +125,21 @@ final class SpeechInput: ObservableObject {
         let gate = OSAllocatedUnfairLock(initialState: true)
         audioGate = gate
         eouDetector.reset()
-        input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 1_024, format: nil) { [weak self] buffer, _ in
+            self?.ringBuffer.append(buffer)
             gate.withLock { acceptingAudio in
-                if acceptingAudio { request.append(buffer) }
+                if acceptingAudio { self?.request?.append(buffer) }
             }
             if let event = self?.eouDetector.process(buffer: buffer) {
                 if case .endOfUtterance = event {
                     Task { @MainActor [weak self] in
                         guard let self, self.generation == current, self.isListening else { return }
                         self.onClauseClosed?()
-                        if self.handsFree && !self.transcript.isEmpty {
+                        if self.isSessionMode {
+                            if !self.transcript.isEmpty {
+                                self.finishCurrentClause()
+                            }
+                        } else if self.handsFree && !self.transcript.isEmpty {
                             self.finish()
                         }
                     }
@@ -153,22 +172,37 @@ final class SpeechInput: ObservableObject {
                             self.silenceTask = Task { [weak self] in
                                 do { try await Task.sleep(nanoseconds: 1_500_000_000) } catch { return }
                                 guard let self, self.generation == current else { return }
-                                self.finish()
+                                if self.isSessionMode {
+                                    self.finishCurrentClause()
+                                } else {
+                                    self.finish()
+                                }
                             }
                         }
                     }
                 }
                 if let error {
-                    self.handleRecognitionError(error as NSError, handsFree: self.handsFree)
-                } else if let result, result.isFinal {
-                    self.stopAudio()
-                    self.task = nil
-                    self.request = nil
-                    self.pendingFinal = result.bestTranscription.formattedString
-                    if self.releaseRequested || self.handsFree {
-                        self.deliverFinal()
+                    if self.isSessionMode {
+                        self.restartSessionTask()
                     } else {
-                        self.status = "Speech complete. Release the shortcut to use this command."
+                        self.handleRecognitionError(error as NSError, handsFree: self.handsFree)
+                    }
+                } else if let result, result.isFinal {
+                    if self.isSessionMode {
+                        let finalResult = result.bestTranscription.formattedString
+                        self.transcript = ""
+                        self.onFinal?(finalResult)
+                        self.restartSessionTask()
+                    } else {
+                        self.stopAudio()
+                        self.task = nil
+                        self.request = nil
+                        self.pendingFinal = result.bestTranscription.formattedString
+                        if self.releaseRequested || self.handsFree {
+                            self.deliverFinal()
+                        } else {
+                            self.status = "Speech complete. Release the shortcut to use this command."
+                        }
                     }
                 }
             }
@@ -179,7 +213,7 @@ final class SpeechInput: ObservableObject {
             try engine.start()
             isListening = true
             status = "Listening — \(recognitionMode)."
-            if handsFree {
+            if handsFree && !isSessionMode {
                 sessionTask = Task { [weak self] in
                     do { try await Task.sleep(nanoseconds: 45_000_000_000) } catch { return }
                     guard let self, self.generation == current, !self.releaseRequested else { return }
@@ -193,6 +227,85 @@ final class SpeechInput: ObservableObject {
             cancel()
             status = error.localizedDescription
             throw error
+        }
+    }
+
+    /// Starts ongoing multi-command session without 45s cap, replay-on-restart, and continuous recognition.
+    func startSession(vocabulary: [String] = []) async throws {
+        isSessionMode = true
+        sessionVocabulary = vocabulary
+        ringBuffer.clear()
+        eouDetector = EnergyEOU(config: .sessionPhase)
+        try await start(handsFree: true, wakePhrase: nil)
+    }
+
+    func endSession(reason: String = "Session closed") {
+        isSessionMode = false
+        sessionVocabulary = []
+        ringBuffer.clear()
+        eouDetector = EnergyEOU(config: .wakePhase)
+        cancel()
+        status = reason
+    }
+
+    func finishCurrentClause() {
+        guard isSessionMode, isListening else {
+            finish()
+            return
+        }
+        silenceTask?.cancel(); silenceTask = nil
+        request?.endAudio()
+        task?.finish()
+    }
+
+    private func restartSessionTask() {
+        guard isSessionMode, isListening, let recognizer, recognizer.isAvailable else { return }
+        task?.cancel()
+        let newRequest = SFSpeechAudioBufferRecognitionRequest()
+        newRequest.shouldReportPartialResults = true
+        newRequest.taskHint = .dictation
+        if #available(macOS 13, *) {
+            newRequest.addsPunctuation = false
+        }
+        newRequest.contextualStrings = sessionVocabulary.isEmpty ? SpeechVocabulary.shared.commandStrings() : sessionVocabulary
+        let mode = RecognitionSettings.shared.mode
+        if mode == .preferAppleServers {
+            newRequest.requiresOnDeviceRecognition = false
+        } else if recognizer.supportsOnDeviceRecognition {
+            newRequest.requiresOnDeviceRecognition = true
+        }
+        self.request = newRequest
+        let current = generation
+
+        // Replay snapshot from ring buffer so seamless audio continuity is preserved
+        let buffered = ringBuffer.snapshot()
+        for buf in buffered {
+            newRequest.append(buf)
+        }
+
+        task = recognizer.recognitionTask(with: newRequest) { [weak self] result, error in
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == current else { return }
+                if let result {
+                    let text = result.bestTranscription.formattedString
+                    if text != self.transcript {
+                        self.transcript = text
+                        self.onPartial?(text)
+                    }
+                }
+                if let error {
+                    if self.isSessionMode {
+                        self.restartSessionTask()
+                    } else {
+                        self.handleRecognitionError(error as NSError, handsFree: true)
+                    }
+                } else if let result, result.isFinal {
+                    let finalResult = result.bestTranscription.formattedString
+                    self.transcript = ""
+                    self.onFinal?(finalResult)
+                    self.restartSessionTask()
+                }
+            }
         }
     }
 

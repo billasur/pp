@@ -1,0 +1,9 @@
+{
+  "name": "pp.browser.host",
+  "description": "pp Voice Assistant Native Messaging Host",
+  "path": "/Applications/pp.app/Contents/MacOS/pp",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://dnlkggbpepndfdfaflbmlkeflmbjhfpc/"
+  ]
+}

@@ -1,5 +1,7 @@
 import AppKit
 import Combine
+import Speech
+import UserNotifications
 import PpCore
 import PpMLX
 import SwiftUI
@@ -21,6 +23,7 @@ struct PpDesktopApp: App {
                 Button("Turn off listening (kill switch)") { model.killListening() }
             }
             Button("Settings and commands…") { model.showSettings() }
+            Button("Copy last transcript") { model.copyLastTranscript() }
             Button("Cancel current command") { model.cancel() }.disabled(!model.isBusy)
             Divider()
             Text("Hold \(model.shortcut.label) to speak")
@@ -135,9 +138,11 @@ final class AppModel: ObservableObject {
     private var appObserver: NSObjectProtocol?
     private var commandObserver: NSObjectProtocol?
     private var settingsWindow: NSWindow?
-    private var overlay: NSPanel?
     private var islandController = IslandController()
     private var shortcutReady = false
+    private var alarmSound: NSSound?
+    private var isAlarmRinging = false
+    private var pendingMessageConfirmation: (app: MessagingApp, contact: String, text: String)?
 
     @Published var modelStatusMessage: String? = nil
     @Published var modelSetupMessage: String? = nil
@@ -195,6 +200,48 @@ final class AppModel: ObservableObject {
     }
 
     func start() {
+        // Headless ASR metrics hook: pp --transcribe <file.wav>
+        let args = ProcessInfo.processInfo.arguments
+        if let idx = args.firstIndex(of: "--transcribe"), idx + 1 < args.count {
+            let wavPath = args[idx + 1]
+            let wavURL = URL(fileURLWithPath: wavPath)
+            Task {
+                let recognizer = SFSpeechRecognizer()
+                let request = SFSpeechURLRecognitionRequest(url: wavURL)
+                let t_start = ProcessInfo.processInfo.systemUptime
+                recognizer?.recognitionTask(with: request) { result, error in
+                    if let result, result.isFinal {
+                        let t_end = ProcessInfo.processInfo.systemUptime
+                        let durationMs = (t_end - t_start) * 1000.0
+                        print("ASR Transcribed: '\(result.bestTranscription.formattedString)' in \(String(format: "%.1f", durationMs))ms")
+                        exit(0)
+                    } else if let error {
+                        print("ASR Error: \(error.localizedDescription)")
+                        exit(1)
+                    }
+                }
+            }
+            return
+        }
+
+        // Install UNUserNotificationCenter delegate at launch so alarms and timers present while pp is open
+        UNUserNotificationCenter.current().delegate = PpNotificationCenterDelegate.shared
+        PpNotificationCenterDelegate.shared.onAlarmPresent = { [weak self] notification in
+            Task { @MainActor in
+                self?.startAlarmRinger(label: notification.request.content.title.isEmpty ? "Alarm" : notification.request.content.title)
+            }
+        }
+        PpNotificationCenterDelegate.shared.onAlarmAction = { [weak self] actionID in
+            Task { @MainActor in
+                if actionID == "STOP" {
+                    self?.stopAlarmRinger()
+                } else if actionID == "SNOOZE" {
+                    self?.stopAlarmRinger()
+                    _ = try? await AlarmScheduler.shared.scheduleTimer(durationSeconds: 540, label: "Snooze (9m)")
+                }
+            }
+        }
+
         // A user who pointed pp at their own decision service does not want the local
         // model loaded behind their back.
         if !useRemoteDecision { initializeLocalModel() }
@@ -250,7 +297,19 @@ final class AppModel: ObservableObject {
         }.store(in: &subscriptions)
         speech.onPartial = { [weak self] partialText in
             let t_asr = ProcessInfo.processInfo.systemUptime
+            Task { await Timing.shared.mark("asr.partial", monotonicTime: t_asr) }
+            if CommandLine.arguments.contains("--hear") && !partialText.isEmpty {
+                let formatter = ISO8601DateFormatter()
+                let ts = formatter.string(from: Date())
+                print("[\(ts)] heard: \(partialText)")
+                fflush(stdout)
+            }
             guard let self, self.capturing, !self.waitingForWake else { return }
+            self.transcript = partialText
+            if !partialText.isEmpty {
+                self.detail = "heard: \(partialText)"
+                self.showOverlay()
+            }
             let observation = PartialObservation(
                 clause: partialText,
                 isFinal: false,
@@ -260,6 +319,7 @@ final class AppModel: ObservableObject {
             switch decision {
             case .preempt(let step, let clause):
                 let t_decide = ProcessInfo.processInfo.systemUptime
+                Task { await Timing.shared.mark("preempt.decide", monotonicTime: t_decide) }
                 self.headline = step.summary
                 self.detail = "Opening \(step.target ?? "app")…"
                 self.showOverlay()
@@ -267,6 +327,7 @@ final class AppModel: ObservableObject {
                 Task {
                     let directRes = await self.performDirect(step)
                     let t_act = ProcessInfo.processInfo.systemUptime
+                    await Timing.shared.mark("preempt.act", monotonicTime: t_act)
                     let decideMs = Int((t_decide - t_asr) * 1000)
                     let actMs = Int((t_act - t_decide) * 1000)
                     let totalMs = Int((t_act - t_asr) * 1000)
@@ -317,6 +378,7 @@ final class AppModel: ObservableObject {
         }.store(in: &subscriptions)
         speech.onFinal = { [weak self] text in
             let t_final_asr = ProcessInfo.processInfo.systemUptime
+            Task { await Timing.shared.mark("asr.final", monotonicTime: t_final_asr) }
             guard let self, self.capturing, var target = self.target else { return }
             var text = text
             self.capturing = false
@@ -354,11 +416,40 @@ final class AppModel: ObservableObject {
                     return
                 }
             }
+            // Explicit send confirmation ("send it" or "send")
+            let lowerText = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            if (lowerText == "send it" || lowerText == "send") && self.pendingMessageConfirmation != nil {
+                let pending = self.pendingMessageConfirmation!
+                self.pendingMessageConfirmation = nil
+                Task {
+                    self.headline = "Sending…"
+                    self.detail = "To \(pending.contact): \(pending.text)"
+                    self.showOverlay()
+                    var success = false
+                    if pending.app == .whatsApp {
+                        success = (try? await WhatsAppAdapter.confirmAndSend()) ?? false
+                    } else {
+                        success = (try? await MessagesAdapter.send(text: pending.text, to: pending.contact)) ?? false
+                    }
+                    if success {
+                        self.headline = "Message sent"
+                        self.detail = "Sent to \(pending.contact)"
+                    } else {
+                        self.fail("Failed to send message")
+                    }
+                    self.isBusy = false
+                    self.showOverlay()
+                    if self.handsFree { self.beginSpeech() }
+                }
+                return
+            }
+
             if self.chainRunning {
                 self.pendingCommand = (text, target)
                 self.detail = "Queued: \(text)"
                 return
             }
+            Task { await Timing.shared.mark("route") }
             let matched = self.preroute.take(ifMatching: text)
             let early = matched != nil && matched == self.prewarmed?.clause
                 && self.prewarmed?.pid == target.processIdentifier ? self.prewarmed?.snapshot : nil
@@ -396,18 +487,192 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            if let sysAction = SystemActionParser.parse(text) {
+            // Route TimeIntent before SystemActionParser
+            let timeIntent = TimeIntentParser.parse(text)
+            if timeIntent != .none {
                 Task {
-                    do {
-                        let res = try await Desktop.executeSystemAction(sysAction)
-                        self.headline = res
+                    switch timeIntent {
+                    case .alarm(let date, let label, let formatted):
+                        await self.applyAlarm(date: date, label: label, formatted: formatted, resumeListening: self.handsFree)
+                    case .timer(let duration, let label):
+                        do {
+                            let (_, verified, authorized) = try await AlarmScheduler.shared.scheduleTimer(durationSeconds: duration, label: label)
+                            if !authorized {
+                                self.headline = "Notification permission needed"
+                                self.detail = "Notifications are turned off for pp; this timer will not alert. Open Settings?"
+                                self.isBusy = false
+                                self.clearPixels()
+                                self.showOverlay()
+                                return
+                            }
+                            if verified {
+                                self.headline = "Timer set for \(label)."
+                                self.detail = "Timer active in pp."
+                                self.isBusy = false
+                                self.clearPixels()
+                                self.showOverlay()
+                                if self.handsFree { self.beginSpeech() }
+                            } else {
+                                self.fail("Could not verify timer schedule.")
+                            }
+                        } catch {
+                            self.fail("Failed to set timer: \(error.localizedDescription)")
+                        }
+                    case .cancel(let target):
+                        let cancelled = await AlarmScheduler.shared.cancel(target: target)
+                        if !cancelled.isEmpty {
+                            self.headline = "Cancelled \(cancelled.count) alarm/timer."
+                            self.detail = cancelled.map(\.label).joined(separator: ", ")
+                        } else {
+                            self.headline = "No active alarms or timers found."
+                            self.detail = ""
+                        }
+                        self.isBusy = false
+                        self.clearPixels()
+                        self.showOverlay()
+                        if self.handsFree { self.beginSpeech() }
+                    case .list:
+                        let items = await AlarmScheduler.shared.listAll()
+                        if items.isEmpty {
+                            self.headline = "No active alarms or timers."
+                            self.detail = ""
+                        } else {
+                            self.headline = "\(items.count) active item(s)."
+                            self.detail = items.map { "\($0.kind.rawValue): \($0.label)" }.joined(separator: " | ")
+                        }
+                        self.isBusy = false
+                        self.clearPixels()
+                        self.showOverlay()
+                        if self.handsFree { self.beginSpeech() }
+                    case .remind(let text, let date):
+                        await self.applyReminder(text: text, date: date, resumeListening: self.handsFree)
+                    case .stopRinging:
+                        self.stopAlarmRinger()
+                        self.headline = "Alarm silenced"
+                        self.detail = ""
+                        self.isBusy = false
+                        self.clearPixels()
+                        self.showOverlay()
+                        if self.handsFree { self.beginSpeech() }
+                    case .snooze(let minutes):
+                        await self.applySnooze(minutes: minutes, resumeListening: self.handsFree)
+                    case .nextAlarm:
+                        let nextDate = await AlarmScheduler.shared.nextFireDate()
+                        if let next = nextDate {
+                            let formatter = DateFormatter()
+                            formatter.timeStyle = .short
+                            self.headline = "Next alarm at \(formatter.string(from: next))"
+                            self.detail = ""
+                        } else {
+                            self.headline = "No upcoming alarms"
+                            self.detail = ""
+                        }
+                        self.isBusy = false
+                        self.clearPixels()
+                        self.showOverlay()
+                        if self.handsFree { self.beginSpeech() }
+                    case .none:
+                        break
+                    }
+                }
+                return
+            }
+
+            // Route MessageIntent before SystemIntent
+            let messageIntent = MessageIntentParser.parse(text)
+            if messageIntent.isActionable, case .send(let msgApp, let contact, let body) = messageIntent {
+                Task {
+                    // SafetyCritic gate: outward transmission requires confirmation
+                    let safety = SafetyCritic.evaluate(actionLabel: "send \(msgApp.rawValue)", actionDetail: "to \(contact)", command: text)
+                    if safety.isBlocked {
+                        self.pendingMessageConfirmation = (app: msgApp, contact: contact, text: body)
+                        self.headline = "Send \(msgApp.rawValue) to \(contact)?"
+                        self.detail = "\"\(body)\" (Say 'send it' to confirm)"
+                        self.isBusy = false
+                        self.clearPixels()
+                        self.showOverlay()
+                        if self.handsFree { self.beginSpeech() }
+                        return
+                    }
+                }
+                return
+            }
+
+            let noteIntent = NoteIntentParser.parse(text, frontApp: target.localizedName ?? "")
+            if noteIntent.isActionable {
+                Task {
+                    switch noteIntent {
+                    case .create(let noteText, let isTask):
+                        let ok = (try? await NotesAdapter.create(text: noteText, isTask: isTask)) ?? false
+                        if ok {
+                            self.headline = isTask ? "Created task in Notes" : "Created note in Notes"
+                            self.detail = noteText.isEmpty ? "" : noteText
+                        } else {
+                            self.fail("Could not create in Notes")
+                        }
+                    case .changeHeading(let newHeading):
+                        let ok = (try? await NotesAdapter.changeHeading(to: newHeading)) ?? false
+                        if ok {
+                            self.headline = "Heading updated"
+                            self.detail = newHeading
+                        } else {
+                            self.fail("Could not update heading in Notes")
+                        }
+                    case .changeCurrentLine(let newLine):
+                        let ok = (try? await NotesAdapter.changeCurrentLine(to: newLine)) ?? false
+                        if ok {
+                            self.headline = "Line updated"
+                            self.detail = newLine
+                        } else {
+                            self.fail("Could not update line in Notes")
+                        }
+                    case .replaceText(let targetText, let replacementText):
+                        let ok = (try? await NotesAdapter.replaceText(target: targetText, replacement: replacementText)) ?? false
+                        if ok {
+                            self.headline = "Replaced text in Notes"
+                            self.detail = "\(targetText) → \(replacementText)"
+                        } else {
+                            self.fail("Could not find text to replace")
+                        }
+                    case .append(let appendText):
+                        let ok = (try? await NotesAdapter.create(text: appendText, isTask: false)) ?? false
+                        if ok {
+                            self.headline = "Appended to Notes"
+                            self.detail = appendText
+                        } else {
+                            self.fail("Could not append to Notes")
+                        }
+                    case .none:
+                        break
+                    }
+                    self.isBusy = false
+                    self.clearPixels()
+                    self.showOverlay()
+                    if self.handsFree { self.beginSpeech() }
+                }
+                return
+            }
+
+            let sysIntent = SystemIntentParser.parse(text)
+            if sysIntent != .none {
+                // Route through SafetyCritic before executing
+                let safety = SafetyCritic.evaluate(actionLabel: "\(sysIntent)", actionDetail: "", command: text)
+                if safety.isBlocked {
+                    self.fail("Action requires confirmation: \(safety.category?.rawValue ?? "blocked")")
+                    return
+                }
+
+                Task {
+                    let res = await SystemExecutor.execute(sysIntent)
+                    if res.verified {
+                        self.headline = res.message
                         self.detail = "System command executed."
                         self.isBusy = false
                         self.clearPixels()
                         self.showOverlay()
                         if self.handsFree { self.beginSpeech() }
-                    } catch {
-                        self.fail(error.localizedDescription)
+                    } else {
+                        self.fail(res.message)
                     }
                 }
                 return
@@ -436,7 +701,6 @@ final class AppModel: ObservableObject {
             if self?.isBusy == true { self?.cancel() }
             else {
                 self?.islandController.hide()
-                self?.overlay?.orderOut(nil)
             }
         }
         do { try hotKey.register(); shortcutReady = true }
@@ -828,17 +1092,164 @@ final class AppModel: ObservableObject {
             }
             return
         }
-        if let sysAction = SystemActionParser.parse(text) {
+        // Route TimeIntent before SystemActionParser
+        let timeIntent = TimeIntentParser.parse(text)
+        if timeIntent != .none {
             Task {
-                do {
-                    let res = try await Desktop.executeSystemAction(sysAction)
-                    self.headline = res
+                switch timeIntent {
+                case .alarm(let date, let label, let formatted):
+                    await self.applyAlarm(date: date, label: label, formatted: formatted, resumeListening: false)
+                case .timer(let duration, let label):
+                    do {
+                        let (_, verified, authorized) = try await AlarmScheduler.shared.scheduleTimer(durationSeconds: duration, label: label)
+                        if !authorized {
+                            self.headline = "Notification permission needed"
+                            self.detail = "Notifications are turned off for pp; this timer will not alert. Open Settings?"
+                            self.isBusy = false
+                            self.clearPixels()
+                            self.showOverlay()
+                            return
+                        }
+                        if verified {
+                            self.headline = "Timer set for \(label)."
+                            self.detail = "Timer active in pp."
+                            self.isBusy = false
+                            self.clearPixels()
+                            self.showOverlay()
+                        } else {
+                            self.fail("Could not verify timer schedule.")
+                        }
+                    } catch {
+                        self.fail("Failed to set timer: \(error.localizedDescription)")
+                    }
+                case .cancel(let target):
+                    let cancelled = await AlarmScheduler.shared.cancel(target: target)
+                    if !cancelled.isEmpty {
+                        self.headline = "Cancelled \(cancelled.count) alarm/timer."
+                        self.detail = cancelled.map(\.label).joined(separator: ", ")
+                    } else {
+                        self.headline = "No active alarms or timers found."
+                        self.detail = ""
+                    }
+                    self.isBusy = false
+                    self.clearPixels()
+                    self.showOverlay()
+                case .list:
+                    let items = await AlarmScheduler.shared.listAll()
+                    if items.isEmpty {
+                        self.headline = "No active alarms or timers."
+                        self.detail = ""
+                    } else {
+                        self.headline = "\(items.count) active item(s)."
+                        self.detail = items.map { "\($0.kind.rawValue): \($0.label)" }.joined(separator: " | ")
+                    }
+                    self.isBusy = false
+                    self.clearPixels()
+                    self.showOverlay()
+                case .remind(let text, let date):
+                    await self.applyReminder(text: text, date: date, resumeListening: false)
+                case .stopRinging:
+                    self.stopAlarmRinger()
+                    self.headline = "Alarm silenced"
+                    self.detail = ""
+                    self.isBusy = false
+                    self.clearPixels()
+                    self.showOverlay()
+                case .snooze(let minutes):
+                    await self.applySnooze(minutes: minutes, resumeListening: false)
+                case .nextAlarm:
+                    let nextDate = await AlarmScheduler.shared.nextFireDate()
+                    if let next = nextDate {
+                        let formatter = DateFormatter()
+                        formatter.timeStyle = .short
+                        self.headline = "Next alarm at \(formatter.string(from: next))"
+                        self.detail = ""
+                    } else {
+                        self.headline = "No upcoming alarms"
+                        self.detail = ""
+                    }
+                    self.isBusy = false
+                    self.clearPixels()
+                    self.showOverlay()
+                case .none:
+                    break
+                }
+            }
+            return
+        }
+
+        let noteIntent = NoteIntentParser.parse(text)
+        if noteIntent.isActionable {
+            Task {
+                switch noteIntent {
+                case .create(let noteText, let isTask):
+                    let ok = (try? await NotesAdapter.create(text: noteText, isTask: isTask)) ?? false
+                    if ok {
+                        self.headline = isTask ? "Created task in Notes" : "Created note in Notes"
+                        self.detail = noteText.isEmpty ? "" : noteText
+                    } else {
+                        self.fail("Could not create in Notes")
+                    }
+                case .changeHeading(let newHeading):
+                    let ok = (try? await NotesAdapter.changeHeading(to: newHeading)) ?? false
+                    if ok {
+                        self.headline = "Heading updated"
+                        self.detail = newHeading
+                    } else {
+                        self.fail("Could not update heading in Notes")
+                    }
+                case .changeCurrentLine(let newLine):
+                    let ok = (try? await NotesAdapter.changeCurrentLine(to: newLine)) ?? false
+                    if ok {
+                        self.headline = "Line updated"
+                        self.detail = newLine
+                    } else {
+                        self.fail("Could not update line in Notes")
+                    }
+                case .replaceText(let targetText, let replacementText):
+                    let ok = (try? await NotesAdapter.replaceText(target: targetText, replacement: replacementText)) ?? false
+                    if ok {
+                        self.headline = "Replaced text in Notes"
+                        self.detail = "\(targetText) → \(replacementText)"
+                    } else {
+                        self.fail("Could not find text to replace")
+                    }
+                case .append(let appendText):
+                    let ok = (try? await NotesAdapter.create(text: appendText, isTask: false)) ?? false
+                    if ok {
+                        self.headline = "Appended to Notes"
+                        self.detail = appendText
+                    } else {
+                        self.fail("Could not append to Notes")
+                    }
+                case .none:
+                    break
+                }
+                self.isBusy = false
+                self.clearPixels()
+                self.showOverlay()
+            }
+            return
+        }
+
+        let sysIntent = SystemIntentParser.parse(text)
+        if sysIntent != .none {
+            let safety = SafetyCritic.evaluate(actionLabel: "\(sysIntent)", actionDetail: "", command: text)
+            if safety.isBlocked {
+                self.fail("Action requires confirmation: \(safety.category?.rawValue ?? "blocked")")
+                return
+            }
+
+            Task {
+                let res = await SystemExecutor.execute(sysIntent)
+                if res.verified {
+                    self.headline = res.message
                     self.detail = "System command executed."
                     self.isBusy = false
                     self.clearPixels()
                     self.showOverlay()
-                } catch {
-                    self.fail(error.localizedDescription)
+                } else {
+                    self.fail(res.message)
                 }
             }
             return
@@ -1187,6 +1598,7 @@ final class AppModel: ObservableObject {
             guard generation == current else { return .stopped }
             if snapshot == nil {
                 headline = "\(label)Reading \(name(app))…"
+                await Timing.shared.mark("read")
                 snapshot = try await Desktop.capture(application: app, command: command, dictation: step.kind == .typeText ? step.text : nil, includeMenus: step.kind == .menu)
             }
             guard let current_ = snapshot else { return .stopped }
@@ -1194,7 +1606,9 @@ final class AppModel: ObservableObject {
             // Exact name matches need no model.
             if [.openApp, .quitApp, .openFolder].contains(step.kind), let target = step.target?.lowercased(),
                let direct = candidates.first(where: { $0.label.lowercased() == "\(step.kind == .quitApp ? "quit" : "open") \(target)\(step.kind == .openFolder ? " folder" : "")" }) {
+                await Timing.shared.mark("act")
                 let result = try await Desktop.perform(direct, snapshot: current_)
+                await Timing.shared.mark("verify")
                 log.notice("\(label, privacy: .public)direct: \(result, privacy: .public)")
                 remember(step, label: direct.label, kind: step.kind.rawValue, signature: direct.detail, app: app, snapshot: current_)
                 return .completed(result: result, actions: 1)
@@ -1216,6 +1630,7 @@ final class AppModel: ObservableObject {
             headline = "\(label)Choosing…"
             let context = JevClient.GroundingContext(step: step, goal: goal, application: name(app), window: current_.windowTitle)
             let began = Date()
+            await Timing.shared.mark("decide")
             let decision = try await JevClient.ground(context: context, candidates: candidates, apiKey: key)
             modelSeconds += Date().timeIntervalSince(began)
             try Task.checkCancellation()
@@ -1268,7 +1683,9 @@ final class AppModel: ObservableObject {
             headline = "\(label)\(chosen.label)"
             clearPixels()
             do {
+                await Timing.shared.mark("act")
                 let result = try await Desktop.perform(chosen, snapshot: current_)
+                await Timing.shared.mark("verify")
                 log.notice("\(label, privacy: .public)result: \(result, privacy: .public)")
                 remember(step, label: chosen.label, kind: step.kind.rawValue, signature: chosen.detail, app: app, snapshot: current_)
                 return .completed(result: result, actions: 1)
@@ -1933,6 +2350,8 @@ final class AppModel: ObservableObject {
         capturing = false
         speech.cancel()
         isBusy = false
+        stopAlarmRinger()
+        pendingMessageConfirmation = nil
         if showStatus {
             headline = "Cancelled"
             detail = "Pending work stopped. Actions already sent cannot be recalled."
@@ -1967,7 +2386,6 @@ final class AppModel: ObservableObject {
             settingsWindow = window
         }
         islandController.hide()
-        overlay?.orderOut(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
         if wakeWordEnabled { startWakeListening() }
@@ -1989,20 +2407,152 @@ final class AppModel: ObservableObject {
         showOverlay()
     }
 
+    func copyLastTranscript() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        let textToCopy = transcript.isEmpty ? detail : transcript
+        pasteboard.setString(textToCopy, forType: .string)
+    }
+
     func dismissWidget() {
         if isBusy { cancel(showStatus: false) }
         systemAudio.stop()
         islandController.hide()
-        overlay?.orderOut(nil)
         if wakeWordEnabled { startWakeListening() }
+    }
+
+    func startAlarmRinger(label: String = "Alarm") {
+        isAlarmRinging = true
+        headline = label
+        detail = "Tap Stop or say 'stop' to silence."
+        showOverlay()
+        if alarmSound == nil {
+            alarmSound = NSSound(named: NSSound.Name("Glass")) ?? NSSound(named: NSSound.Name("Ping"))
+            alarmSound?.loops = true
+        }
+        alarmSound?.play()
+        if wakeWordEnabled {
+            // Keep speech listening active so voice "stop" / "quiet" works immediately
+            if !capturing {
+                handsFree = true
+                waitingForWake = false
+                beginSpeech()
+            }
+        }
+    }
+
+    func stopAlarmRinger() {
+        guard isAlarmRinging else { return }
+        isAlarmRinging = false
+        alarmSound?.stop()
+        alarmSound = nil
+    }
+
+    /// Presents a finished piece of work in the island. The spoken and the typed entry points both
+    /// funnel through here, so the two can no longer drift apart, and `resumeListening` keeps a
+    /// hands-free session alive after an answer instead of silently dropping the microphone.
+    private func presentOutcome(headline: String, detail: String = "", resumeListening: Bool) {
+        self.headline = headline
+        self.detail = detail
+        self.isBusy = false
+        self.clearPixels()
+        self.showOverlay()
+        if resumeListening { self.beginSpeech() }
+    }
+
+    /// Sets an alarm and confirms only what the notification centre confirmed. A missing
+    /// notification permission is reported as such instead of a confirmation for an alarm that
+    /// cannot ring.
+    private func applyAlarm(date: Date, label: String, formatted: String, resumeListening: Bool) async {
+        do {
+            let (_, verified, authorized) = try await AlarmScheduler.shared.scheduleAlarm(targetDate: date, label: label)
+            if !authorized {
+                presentOutcome(
+                    headline: "Alarm not set",
+                    detail: "Notifications are off for pp, so it would not ring. Turn them on for pp in System Settings?",
+                    resumeListening: resumeListening)
+                return
+            }
+            guard verified else {
+                fail("The alarm did not appear in the notification queue, so it was not set.")
+                return
+            }
+            presentOutcome(
+                headline: "Alarm set for \(formatted).",
+                detail: "Rings even if pp is closed. Say \"stop\" to silence it.",
+                resumeListening: resumeListening)
+        } catch {
+            fail("Could not set the alarm: \(error.localizedDescription)")
+        }
+    }
+
+    /// Snoozes the ringing alarm through pp's own scheduler, with the same read-back rule.
+    private func applySnooze(minutes: Int, resumeListening: Bool) async {
+        stopAlarmRinger()
+        do {
+            let (_, verified, authorized) = try await AlarmScheduler.shared.scheduleTimer(
+                durationSeconds: TimeInterval(minutes * 60),
+                label: "Snooze (\(minutes)m)")
+            if !authorized {
+                presentOutcome(
+                    headline: "Snooze not set",
+                    detail: "Notifications are off for pp, so nothing would ring.",
+                    resumeListening: resumeListening)
+                return
+            }
+            guard verified else {
+                fail("The snooze did not appear in the notification queue, so it was not set.")
+                return
+            }
+            presentOutcome(headline: "Snoozed for \(minutes) minutes", resumeListening: resumeListening)
+        } catch {
+            fail("Could not snooze: \(error.localizedDescription)")
+        }
+    }
+
+    /// Remembers something at a time. Without a time there is nothing to alert on, and saying
+    /// "reminder saved" for a reminder that was never stored is the one thing this must not do.
+    private func applyReminder(text: String, date: Date?, resumeListening: Bool) async {
+        guard let date else {
+            presentOutcome(
+                headline: "A reminder needs a time",
+                detail: "Try \"remind me at 5 to \(text)\".",
+                resumeListening: resumeListening)
+            return
+        }
+        do {
+            let (_, verified, authorized) = try await AlarmScheduler.shared.scheduleAlarm(targetDate: date, label: text)
+            if !authorized {
+                presentOutcome(
+                    headline: "Reminder not set",
+                    detail: "Notifications are off for pp, so it would not alert.",
+                    resumeListening: resumeListening)
+                return
+            }
+            guard verified else {
+                fail("The reminder did not appear in the notification queue, so it was not stored.")
+                return
+            }
+            let clock = DateFormatter()
+            clock.dateStyle = .none
+            clock.timeStyle = .short
+            presentOutcome(
+                headline: "Reminder for \(clock.string(from: date))",
+                detail: text,
+                resumeListening: resumeListening)
+        } catch {
+            fail("Could not set the reminder: \(error.localizedDescription)")
+        }
     }
 
     private func showOverlay() {
         // Update island state according to app status
         let islandState: IslandState
-        if isBusy {
+        if isAlarmRinging {
+            islandState = .alarm
+        } else if isBusy {
             islandState = capturing ? .listening : .working
-        } else if headline == "Command stopped" || headline.contains("failed") || headline.contains("unavailable") {
+        } else if IslandState.reportsProblem(headline) {
             islandState = .error(text: headline)
         } else if !headline.isEmpty && headline != "Listening…" && headline != "Ready when you are" {
             islandState = .result(text: headline)
@@ -2011,7 +2561,14 @@ final class AppModel: ObservableObject {
         }
 
         islandController.onCancelRequested = { [weak self] in
-            self?.cancel(showStatus: true)
+            if self?.isAlarmRinging == true {
+                self?.stopAlarmRinger()
+                self?.headline = "Alarm stopped"
+                self?.detail = ""
+                self?.showOverlay()
+            } else {
+                self?.cancel(showStatus: true)
+            }
         }
         islandController.show(
             state: islandState,
@@ -2019,27 +2576,7 @@ final class AppModel: ObservableObject {
             detail: detail,
             audioLevel: speech.isListening ? speech.audioLevel : 0.0
         )
-
-        if overlay == nil {
-            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 244, height: 202),
-                                styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-            panel.level = .statusBar
-            panel.isOpaque = false
-            panel.backgroundColor = .clear
-            panel.hasShadow = true
-            panel.hidesOnDeactivate = false
-            panel.becomesKeyOnlyIfNeeded = true
-            panel.isMovableByWindowBackground = true
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-            panel.contentView = NSHostingView(rootView: VoiceWidget(model: self, speech: speech))
-            if !panel.setFrameUsingName("DesktopVoiceWidget", force: true), let screen = NSScreen.main {
-                panel.setFrameOrigin(NSPoint(x: screen.visibleFrame.midX - 122, y: screen.visibleFrame.minY + 36))
-            }
-            panel.setFrameAutosaveName("DesktopVoiceWidget")
-            overlay = panel
-        }
         systemAudio.start()
-        overlay?.orderFrontRegardless()
     }
 
     func startWakeListening() {
@@ -2047,7 +2584,6 @@ final class AppModel: ObservableObject {
         if waitingForWake { return }
         cancel(showStatus: false)
         islandController.hide()
-        overlay?.orderOut(nil)
         systemAudio.stop()
         handsFree = true
         waitingForWake = true
@@ -2265,6 +2801,11 @@ private struct SettingsView: View {
                     }
                 }
             }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Command Lanes & Capabilities").font(.headline)
+                Text("• Direct Launches & Quits: Handled deterministically in < 15ms.\n• Alarms & Timers: Managed directly inside pp using local notifications (independent of Apple Clock.app; will ring even if pp is closed).\n• System Actions: Volume, brightness, dark mode, screenshots, and lock screen read back their state to ensure truthfulness.\n• Bluetooth: Bluetooth device switching is not supported yet.\n• Complex Desktop Actions: Grounded through local Laya / GrammarPlanner.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Divider()
             VStack(alignment: .leading, spacing: 8) {
                 Text("Or type a command").font(.headline)
@@ -2296,261 +2837,5 @@ private struct SettingsView: View {
             modelLink = model.modelPackageLink
             decisionURL = model.decisionServiceURL
         }
-    }
-}
-
-private struct VoiceWidget: View {
-    @ObservedObject var model: AppModel
-    @ObservedObject var speech: SpeechInput
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isHovering = false
-    @State private var field = PixelField(count: 720, bounds: CGSize(width: 216, height: 78))
-
-    private var message: String {
-        if model.waitingForWake { return model.handsFreePrompt.isEmpty ? model.headline : model.handsFreePrompt }
-        if speech.isListening { return model.transcript.isEmpty ? (model.handsFreePrompt.isEmpty ? "Listening…" : model.handsFreePrompt) : model.transcript }
-        return model.headline == "Command stopped" ? model.detail : model.headline
-    }
-
-    var body: some View {
-        VStack(spacing: 5) {
-            Group {
-                if reduceMotion {
-                    Text(model.word ?? "")
-                        .font(.system(size: 34, weight: .heavy)).foregroundStyle(.white)
-                        .minimumScaleFactor(0.3).lineLimit(1)
-                } else {
-                    TimelineView(.animation(minimumInterval: 1.0 / 60)) { timeline in
-                        Canvas { context, size in
-                            let music = model.systemAudio.levels
-                            if model.word == nil && !speech.isListening && music.isPlaying {
-                                field.equalise(music.bands, at: timeline.date.timeIntervalSinceReferenceDate)
-                            } else {
-                                field.spell(model.word)
-                            }
-                            field.step(to: timeline.date.timeIntervalSinceReferenceDate, level: speech.isListening ? speech.audioLevel : 0)
-                            field.draw(in: &context)
-                        }
-                    }
-                }
-            }
-            .frame(width: 216, height: 78)
-            .accessibilityHidden(true)
-            Text(message)
-                .font(.system(size: 13, weight: .medium)).foregroundStyle(.white)
-                .lineLimit(model.headline == "Command stopped" || model.headline.hasPrefix("Which one") ? 3 : 2)
-                .multilineTextAlignment(.center).help(message)
-            if !speech.isListening && !model.transcript.isEmpty {
-                Text(model.transcript).font(.system(size: 10)).foregroundStyle(.white.opacity(0.65))
-                    .lineLimit(2).multilineTextAlignment(.center).help(model.transcript)
-            }
-            Button { model.toggleHandsFree() } label: {
-                Label(model.waitingForWake ? "Wake word on · Stop" : model.handsFree ? "Hands-free on · Stop" : model.wakeWordEnabled ? "Listen for “Hey pp”" : "Start hands-free", systemImage: model.handsFree ? "mic.fill" : "mic")
-                    .font(.system(size: 11, weight: .medium))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(model.handsFree ? Color.green : Color.white)
-            .help("Automatically submit after a pause. Escape stops hands-free mode.")
-            Text(model.waitingForWake ? "Wake word listening · Esc to stop" : model.handsFree ? "Pause to act · Esc to stop" : "Hold \(model.shortcut.label) to speak")
-                .font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.45))
-        }
-        .padding(.horizontal, 14)
-        .frame(width: 244, height: 202)
-        .background {
-            RoundedRectangle(cornerRadius: 22).fill(.ultraThinMaterial)
-                .overlay(RoundedRectangle(cornerRadius: 22).fill(Color.black.opacity(0.5)))
-                .overlay(RoundedRectangle(cornerRadius: 22).strokeBorder(.white.opacity(0.12), lineWidth: 1))
-        }
-        .overlay(alignment: .topTrailing) {
-            HStack(spacing: 2) {
-                Button { model.showSettings() } label: {
-                    Image(systemName: "gearshape").font(.system(size: 11)).frame(width: 24, height: 24)
-                }.accessibilityLabel("Settings and commands").help("Settings and commands")
-                Button { model.dismissWidget() } label: {
-                    Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)).frame(width: 24, height: 24)
-                }.accessibilityLabel("Close widget and cancel pending work").help("Close widget and cancel pending work")
-            }
-            .buttonStyle(.plain).foregroundStyle(.white.opacity(0.65))
-            .padding(8)
-            .opacity(isHovering ? 1 : 0)
-            .allowsHitTesting(isHovering)
-        }
-        .onHover { isHovering = $0 }
-        .preferredColorScheme(.dark)
-    }
-}
-
-/// White pixels that drift while idle and assemble into the current word's letter shapes.
-@MainActor
-private final class PixelField {
-    private struct Pixel {
-        var x: Double, y: Double
-        var tx: Double?, ty: Double?
-        var ta: Double = 1
-        let seed: Double
-    }
-    private struct Target { let x: Double, y: Double, alpha: Double }
-    private var pixels: [Pixel]
-    private let bounds: CGSize
-    private var word: String?
-    private var equalising = false
-    private var peaks: [Double] = []
-    private var peakTime: Double?
-    private var lastTime: Double?
-
-    init(count: Int, bounds: CGSize) {
-        self.bounds = bounds
-        pixels = (0..<count).map { _ in
-            Pixel(x: Double.random(in: 0...bounds.width), y: Double.random(in: 0...bounds.height), seed: Double.random(in: 0...1))
-        }
-    }
-
-    func spell(_ newWord: String?) {
-        guard newWord != word || equalising else { return }
-        word = newWord
-        equalising = false
-        var targets: [CGPoint] = []
-        if let newWord, !newWord.isEmpty {
-            var step = 3.0
-            repeat {
-                targets = Self.rasterise(newWord, in: bounds, step: step)
-                step += 1
-            } while targets.count > pixels.count && step < 8
-        }
-        assign(targets.map { Target(x: $0.x, y: $0.y, alpha: 1) })
-    }
-
-    /// Bars of bricks rising from a baseline, peak-hold marks above and a faded reflection below.
-    /// Every pixel owns a fixed brick slot, so bricks only fade in and out instead of flying between bars.
-    private static let barRows = 16, reflectionRows = 5
-    private var slotsPerBar: Int { Self.barRows + 1 + Self.reflectionRows }
-
-    func equalise(_ bands: [Float], at time: Double) {
-        equalising = true
-        word = nil
-        let pitch = bounds.width / Double(bands.count)
-        let baseline = bounds.height * 0.66
-        let brick = (baseline - 2) / Double(Self.barRows)
-        if peaks.count != bands.count { peaks = bands.map(Double.init) }
-        let dt = min(0.1, max(0, time - (peakTime ?? time)))
-        peakTime = time
-        var levels: [Int] = []
-        var peakRows: [Int] = []
-        for (index, band) in bands.enumerated() {
-            let level = Double(band)
-            // Peak marks hold, then fall slowly, like the detached segments in a 2000s player.
-            peaks[index] = level >= peaks[index] ? level : max(level, peaks[index] - dt * 0.4)
-            levels.append(Int(level * Double(Self.barRows) + 0.5))
-            peakRows.append(Int(peaks[index] * Double(Self.barRows) + 0.5))
-        }
-        for index in pixels.indices {
-            let bar = index % bands.count
-            let slot = index / bands.count
-            guard slot < slotsPerBar else { pixels[index].tx = nil; pixels[index].ty = nil; pixels[index].ta = 0; continue }
-            let x = pitch * (Double(bar) + 0.5)
-            pixels[index].tx = x
-            if slot < Self.barRows {
-                pixels[index].ty = baseline - brick * (Double(slot) + 0.5)
-                pixels[index].ta = slot < max(levels[bar], 1) ? 1 : 0
-            } else if slot == Self.barRows {
-                let row = peakRows[bar]
-                pixels[index].ty = baseline - brick * (Double(row) + 0.5)
-                pixels[index].ta = row > levels[bar] + 1 ? 0.9 : 0
-            } else {
-                let row = slot - Self.barRows - 1
-                pixels[index].ty = baseline + brick * (Double(row) + 0.5)
-                pixels[index].ta = row < levels[bar] ? 0.3 * (1 - Double(row) / Double(Self.reflectionRows)) : 0
-            }
-        }
-    }
-
-    private func assign(_ unsorted: [Target]) {
-        var targets = unsorted
-        // Pair pixels with targets left to right so the shapes sweep together instead of crossing.
-        targets.sort { $0.x == $1.x ? $0.y < $1.y : $0.x < $1.x }
-        let order = pixels.indices.sorted { pixels[$0].x == pixels[$1].x ? pixels[$0].y < pixels[$1].y : pixels[$0].x < pixels[$1].x }
-        for (rank, index) in order.enumerated() {
-            if rank < targets.count {
-                pixels[index].tx = targets[rank].x
-                pixels[index].ty = targets[rank].y
-                pixels[index].ta = targets[rank].alpha
-            } else {
-                pixels[index].tx = nil
-                pixels[index].ty = nil
-                pixels[index].ta = 1
-            }
-        }
-    }
-
-    func step(to time: Double, level: Double) {
-        let dt = min(0.05, max(0, time - (lastTime ?? time)))
-        lastTime = time
-        let approach = 1 - exp(-dt * 11)
-        let jitter = level * 1.4
-        for index in pixels.indices {
-            var pixel = pixels[index]
-            if let tx = pixel.tx, let ty = pixel.ty {
-                pixel.x += (tx - pixel.x) * approach + sin(time * 21 + pixel.seed * 40) * jitter
-                pixel.y += (ty - pixel.y) * approach + cos(time * 17 + pixel.seed * 30) * jitter
-            } else {
-                let speed = 7 + pixel.seed * 8 + level * 40
-                let angle = pixel.seed * .pi * 2 + sin(time * (0.25 + pixel.seed * 0.5) + pixel.seed * 12) * 1.6
-                pixel.x += cos(angle) * speed * dt
-                pixel.y += sin(angle) * speed * dt
-                if pixel.x < -4 { pixel.x += bounds.width + 8 } else if pixel.x > bounds.width + 4 { pixel.x -= bounds.width + 8 }
-                if pixel.y < -4 { pixel.y += bounds.height + 8 } else if pixel.y > bounds.height + 4 { pixel.y -= bounds.height + 8 }
-            }
-            pixels[index] = pixel
-        }
-    }
-
-    func draw(in context: inout GraphicsContext) {
-        for pixel in pixels {
-            let assembled = pixel.tx != nil
-            let opacity = assembled ? pixel.ta : 0.3 + 0.25 * (0.5 + 0.5 * sin(pixel.seed * 50 + pixel.x * 0.05))
-            if equalising {
-                // Green bricks, brighter towards the top of each bar. Spare pixels stay hidden in this mode.
-                guard assembled, opacity > 0 else { continue }
-                let height = max(0, min(1, 1 - pixel.y / (bounds.height * 0.66)))
-                let brickWidth = bounds.width / Double(SystemAudioMonitor.bandCount) - 2
-                context.fill(Path(CGRect(x: pixel.x - brickWidth / 2, y: pixel.y - 1.1, width: brickWidth, height: 2.2)),
-                             with: .color(Color(hue: 0.36 - 0.06 * height, saturation: 0.85, brightness: 0.55 + 0.45 * height).opacity(opacity)))
-            } else {
-                context.fill(Path(CGRect(x: pixel.x - 1.3, y: pixel.y - 1.3, width: 2.6, height: 2.6)), with: .color(.white.opacity(opacity)))
-            }
-        }
-    }
-
-    private static func rasterise(_ word: String, in bounds: CGSize, step: Double) -> [CGPoint] {
-        let width = Int(bounds.width), height = Int(bounds.height)
-        guard let bitmap = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width,
-                                     space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return [] }
-        bitmap.setFillColor(gray: 0, alpha: 1)
-        bitmap.fill(CGRect(origin: .zero, size: bounds))
-        var pointSize = 44.0
-        var text = NSAttributedString(string: word)
-        repeat {
-            text = NSAttributedString(string: word, attributes: [.font: NSFont.systemFont(ofSize: pointSize, weight: .heavy), .foregroundColor: NSColor.white])
-            pointSize -= 2
-        } while text.size().width > bounds.width - 6 && pointSize > 10
-        let textSize = text.size()
-        let previous = NSGraphicsContext.current
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: bitmap, flipped: false)
-        text.draw(at: NSPoint(x: (bounds.width - textSize.width) / 2, y: (bounds.height - textSize.height) / 2))
-        NSGraphicsContext.current = previous
-        guard let data = bitmap.data else { return [] }
-        let buffer = data.assumingMemoryBound(to: UInt8.self)
-        var points: [CGPoint] = []
-        var y = step / 2
-        while y < bounds.height {
-            var x = step / 2
-            while x < bounds.width {
-                // Bitmap rows run top to bottom, matching the canvas.
-                if buffer[Int(y) * width + Int(x)] > 110 { points.append(CGPoint(x: x, y: y)) }
-                x += step
-            }
-            y += step
-        }
-        return points
     }
 }

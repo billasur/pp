@@ -61,6 +61,32 @@ public enum DirectIntentParser {
         return words.joined(separator: " ").trimmingCharacters(in: CharacterSet(charactersIn: " .,!?;:"))
     }
 
+    /// Yields normalized tokens alongside their original byte-for-byte Range<String.Index> in text.
+    public static func tokenSpans(_ text: String) -> [(token: String, range: Range<String.Index>)] {
+        var spans: [(token: String, range: Range<String.Index>)] = []
+        var currentIndex = text.startIndex
+
+        while currentIndex < text.endIndex {
+            // Skip leading whitespace / punctuation
+            while currentIndex < text.endIndex, (text[currentIndex].isWhitespace || ".,!?;:".contains(text[currentIndex])) {
+                currentIndex = text.index(after: currentIndex)
+            }
+            if currentIndex >= text.endIndex { break }
+
+            let tokenStart = currentIndex
+            while currentIndex < text.endIndex, !text[currentIndex].isWhitespace, !".,!?;:".contains(text[currentIndex]) {
+                currentIndex = text.index(after: currentIndex)
+            }
+            let tokenEnd = currentIndex
+            let rawSub = text[tokenStart..<tokenEnd]
+            let normalized = rawSub.lowercased()
+            if !normalized.isEmpty {
+                spans.append((token: normalized, range: tokenStart..<tokenEnd))
+            }
+        }
+        return spans
+    }
+
     private static func trimLeadIns(_ text: String) -> String {
         var result = text
         var changed = true
@@ -126,15 +152,66 @@ public enum DirectIntentParser {
 
 /// Picks the one app a spoken name refers to.
 ///
-/// Exact matches win outright; anything else must be an unambiguous prefix. Two candidates
-/// is an ambiguity, and an ambiguous name is not resolved at all — the command goes to the
-/// model instead, which is slower and right.
+/// Exact matches win outright; aliases resolve to canonical names; unambiguous prefixes win;
+/// spelled-out letters ('z e n') collapse; and safe fuzzy match (edit distance <= 1 for length >= 4)
+/// resolves only when exactly one candidate wins. Any ambiguity resolves to nil.
 public enum AppNameMatcher {
     public static func match(_ spoken: String, against names: [String]) -> String? {
-        let wanted = spoken.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var input = spoken.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // (c) Spelled-out input: collapse single-letter tokens ('z e n' -> 'zen')
+        let parts = input.split(separator: " ").map(String.init)
+        if parts.count > 1 && parts.allSatisfy({ $0.count == 1 && ($0.first?.isLetter == true || $0.first?.isNumber == true) }) {
+            input = parts.joined()
+        }
+
+        let wanted = input.lowercased()
         guard wanted.count >= 2 else { return nil }
-        if let exact = names.first(where: { $0 == wanted }) { return exact }
-        let prefixed = names.filter { $0.hasPrefix(wanted) }
-        return prefixed.count == 1 ? prefixed[0] : nil
+
+        // 1. Exact match against candidate names
+        if let exact = names.first(where: { $0.lowercased() == wanted }) { return exact }
+
+        // (a) Alias resolution: if alias maps to a name present in candidate names
+        if let resolved = AppAliases.shared.resolve(wanted) {
+            if let matched = names.first(where: { $0.lowercased() == resolved.lowercased() }) {
+                return matched
+            }
+        }
+
+        // 2. Unambiguous prefix matching
+        let prefixed = names.filter { $0.lowercased().hasPrefix(wanted) }
+        if prefixed.count == 1 { return prefixed[0] }
+        if prefixed.count > 1 { return nil } // Ambiguity must not guess
+
+        // (b) Safe fuzzy matching: edit distance <= 1, only for names >= 4 characters
+        if wanted.count >= 4 {
+            let fuzzy = names.filter { candidate in
+                let candidateLow = candidate.lowercased()
+                guard candidateLow.count >= 4 else { return false }
+                return editDistance(wanted, candidateLow) <= 1
+            }
+            if fuzzy.count == 1 { return fuzzy[0] }
+            if fuzzy.count > 1 { return nil }
+        }
+
+        return nil
+    }
+
+    private static func editDistance(_ s1: String, _ s2: String) -> Int {
+        let a = Array(s1)
+        let b = Array(s2)
+        var dist = Array(repeating: Array(repeating: 0, count: b.count + 1), count: a.count + 1)
+        for i in 0...a.count { dist[i][0] = i }
+        for j in 0...b.count { dist[0][j] = j }
+        for i in 1...a.count {
+            for j in 1...b.count {
+                if a[i - 1] == b[j - 1] {
+                    dist[i][j] = dist[i - 1][j - 1]
+                } else {
+                    dist[i][j] = min(dist[i - 1][j] + 1, dist[i][j - 1] + 1, dist[i - 1][j - 1] + 1)
+                }
+            }
+        }
+        return dist[a.count][b.count]
     }
 }

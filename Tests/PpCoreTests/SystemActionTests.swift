@@ -65,4 +65,13 @@ final class SystemActionTests: XCTestCase {
         let shot = SystemActionParser.parse("take screenshot")
         XCTAssertEqual(shot?.kind, .takeScreenshot)
     }
+
+    func testSystemActionResultVerification() {
+        let failureRes = SystemActionResult(verified: false, message: "System alarms/timers must be configured in pp.")
+        XCTAssertFalse(failureRes.verified)
+        XCTAssertEqual(failureRes.message, "System alarms/timers must be configured in pp.")
+
+        let successRes = SystemActionResult(verified: true, message: "Volume set to 50%.")
+        XCTAssertTrue(successRes.verified)
+    }
 }

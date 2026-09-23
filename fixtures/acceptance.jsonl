@@ -1,0 +1,46 @@
+{"input": "bye", "expected_lane": "dismissal"}
+{"input": "goodbye", "expected_lane": "dismissal"}
+{"input": "that's all", "expected_lane": "dismissal"}
+{"input": "stop listening", "expected_lane": "dismissal"}
+{"input": "quiet", "expected_lane": "dismissal"}
+{"input": "cancel", "expected_lane": "dismissal"}
+{"input": "stop", "expected_lane": "dismissal"}
+{"input": "never mind", "expected_lane": "dismissal"}
+{"input": "thank you", "expected_lane": "dismissal"}
+{"input": "hey pp", "expected_lane": "session"}
+{"input": "heipp", "expected_lane": "session"}
+{"input": "hey p p", "expected_lane": "session"}
+{"input": "ey pp", "expected_lane": "session"}
+{"input": "set an alarm for 7:30", "expected_lane": "time"}
+{"input": "set an alarm for seven thirty", "expected_lane": "time"}
+{"input": "wake me at 6:30", "expected_lane": "time"}
+{"input": "set a timer for 10 minutes", "expected_lane": "time"}
+{"input": "cancel alarm", "expected_lane": "time"}
+{"input": "list alarms", "expected_lane": "time"}
+{"input": "open youtube.com", "expected_lane": "web"}
+{"input": "search youtube.com", "expected_lane": "web"}
+{"input": "search youtube for lofi beats", "expected_lane": "web"}
+{"input": "search github for swift mlx", "expected_lane": "web"}
+{"input": "search wikipedia for quantum computing", "expected_lane": "web"}
+{"input": "google weather tokyo", "expected_lane": "web"}
+{"input": "search for best pizza", "expected_lane": "web"}
+{"input": "play lofi on youtube", "expected_lane": "web"}
+{"input": "youtube.com", "expected_lane": "web"}
+{"input": "visit wikipedia.org", "expected_lane": "web"}
+{"input": "message Diya on whatsapp saying the launch is tomorrow", "expected_lane": "message"}
+{"input": "whatsapp Diya the launch is tomorrow", "expected_lane": "message"}
+{"input": "text Diya I will be late", "expected_lane": "message"}
+{"input": "send Diya a message on whatsapp: see you soon", "expected_lane": "message"}
+{"input": "turn up the volume", "expected_lane": "system"}
+{"input": "mute", "expected_lane": "system"}
+{"input": "set volume to 50 percent", "expected_lane": "system"}
+{"input": "turn on dark mode", "expected_lane": "system"}
+{"input": "lock screen", "expected_lane": "system"}
+{"input": "enable do not disturb", "expected_lane": "system"}
+{"input": "open Notes", "expected_lane": "direct"}
+{"input": "open Finder", "expected_lane": "direct"}
+{"input": "open Zen", "expected_lane": "direct"}
+{"input": "quit Safari", "expected_lane": "direct"}
+{"input": "run ls -la", "expected_lane": "grammar"}
+{"input": "summarize this page", "expected_lane": "model"}
+{"input": "find the invoice from last month and email it to my accountant", "expected_lane": "model"}

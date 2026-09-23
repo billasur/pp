@@ -41,7 +41,10 @@ public enum DismissalPhrase {
             "nevermind",
             "go away",
             "bye",
-            "goodbye"
+            "goodbye",
+            "bye bye",
+            "stop listening",
+            "quiet"
         ]
 
         if politeExact.contains(trimmed) {

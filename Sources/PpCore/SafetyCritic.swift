@@ -55,8 +55,8 @@ public enum SafetyCritic {
              reason: { "Action involves financial payment or purchase ('\($0)')" }),
 
         Rule(category: .outwardTransmission,
-             words: ["send", "post", "tweet", "publish", "broadcast", "mail", "email", "upload", "submit", "reply", "share", "dm"],
-             phrases: ["forward this", "forward it", "forward the", "forward that", "forward to ", "forward message", "forward email", "forward the email", "send it", "post this"],
+             words: ["send", "post", "tweet", "publish", "broadcast", "mail", "email", "upload", "submit", "reply", "share", "dm", "whatsapp", "message"],
+             phrases: ["forward this", "forward it", "forward the", "forward that", "forward to ", "forward message", "forward email", "forward the email", "send it", "post this", "send a message"],
              reason: { "Action sends, publishes or replies with content ('\($0)')" }),
 
         Rule(category: .destructive,

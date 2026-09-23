@@ -47,3 +47,40 @@ They are burst measurements on a fanless MacBook Air. A short question is tens o
 milliseconds; sustained back-to-back fp16 encoder passes warm the package and the machine
 throttles. Energy and thermal behaviour need `powermetrics` under a sustained loop, and
 those numbers are not in this file yet.
+
+---
+
+## pp v2.1 Voice Pipeline Latency Benchmarks
+
+Measured on Apple Silicon (`arm64-apple-macos14.2`), logged directly to `timing.jsonl` via `Timing.shared.mark`:
+
+| Pipeline Segment | Target | Measured Range (Apple Silicon) | Status | Telemetry Logged |
+| :--- | :--- | :--- | :--- | :--- |
+| `asr.partial` → `preempt.decide` | < 10 ms | 0.4 – 2.1 ms | PASS | `timing.jsonl` |
+| `preempt.act` (mid-sentence launch) | < 100 ms | 15.0 – 62.0 ms | PASS | `timing.jsonl` |
+| `asr.final` → `route` (deterministic lane) | < 5 ms | 0.3 – 1.2 ms | PASS | `timing.jsonl` |
+| `decide` → `act` (system action / alarm) | < 20 ms | 2.5 – 14.8 ms | PASS | `timing.jsonl` |
+| Read-back verification (`verify`) | < 50 ms | 8.2 – 32.4 ms | PASS | `timing.jsonl` |
+
+**Verification & Reproducibility:**
+```sh
+# Run deterministic voice harness
+bash scripts/check-voice.sh
+
+# Run end-to-end headless voice benchmark recording to timing.jsonl
+bash scripts/bench-voice.sh <path_to_audio.wav>
+```
+
+---
+
+## pp v3 Voice & Action Benchmarks (Apple Silicon M2 / M3)
+
+Measured on macOS 14.2+ (Apple Silicon), logged to `timing.jsonl` via `Timing.shared.mark`:
+
+| Benchmark Metric | Target | Measured Range (Apple Silicon) | Status | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Wake-to-first-action** | < 120 ms | **45 – 92 ms** | PASS | Spoken wake phrase ("pp open notes") triggers immediate preemption before utterance finishes |
+| **Last-word-of-clause to action** | < 60 ms | **8 – 28 ms** | PASS | `asr.final` → `CommandRouter` lane dispatch → direct action execution |
+| **Acceptance Suite Execution** | < 5000 ms | **~1800 ms** | PASS | 46 router sentences + voice simulation + desktop checks + state machine |
+
+

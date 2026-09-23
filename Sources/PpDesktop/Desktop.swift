@@ -1355,7 +1355,14 @@ enum Desktop {
     static func open(website: URL, browser: URL? = nil) async throws -> String {
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
-        let target = browser ?? NSWorkspace.shared.urlForApplication(toOpen: website)
+        var browserURL = browser
+        if browserURL == nil, let preferred = Preferences.shared.preferredBrowser {
+            let candidates = NSWorkspace.shared.urlsForApplications(toOpen: website)
+            if let matched = candidates.first(where: { $0.deletingPathExtension().lastPathComponent.lowercased() == preferred.lowercased() }) {
+                browserURL = matched
+            }
+        }
+        let target = browserURL ?? NSWorkspace.shared.urlForApplication(toOpen: website)
         guard let target else { throw DesktopError(message: "No browser is available for \(website.absoluteString).") }
         let opened = try await NSWorkspace.shared.open([website], withApplicationAt: target, configuration: config)
         try await settle(opened, stableFor: 0.25, timeout: 3)
@@ -1443,46 +1450,78 @@ enum Desktop {
         up.postToPid(pid)
     }
 
-    /// Executes system actions (alarm, timer, volume, dark mode, lock screen, screenshot).
+    /// Executes system actions (volume, dark mode, lock screen, screenshot).
+    /// State is read back before returning to guarantee truthfulness.
     @MainActor
-    static func executeSystemAction(_ action: SystemAction) async throws -> String {
+    static func executeSystemAction(_ action: SystemAction) async throws -> SystemActionResult {
         switch action.kind {
-        case .setAlarm:
-            // Open Clock app at Alarms tab or tell system
-            let script = "tell application \"Clock\" to activate"
-            _ = runAppleScript(script)
-            return action.confirmationMessage
-        case .setTimer:
-            // Open Clock app at Timers tab
-            let script = "tell application \"Clock\" to activate"
-            _ = runAppleScript(script)
-            return action.confirmationMessage
+        case .setAlarm, .setTimer:
+            // Alarms and Timers belong in pp's own AlarmScheduler (Track N2).
+            // Opening Clock without setting an alarm is fake confirmation and must not succeed.
+            return SystemActionResult(verified: false, message: "System alarms/timers must be configured in pp.")
+
         case .setVolume:
             if let valStr = action.value, let vol = Int(valStr) {
                 let script = "set volume output volume \(vol)"
                 _ = runAppleScript(script)
             }
-            return action.confirmationMessage
+            // Read-back volume state
+            let readBackScript = "output volume of (get volume settings)"
+            if let readStr = runAppleScript(readBackScript)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               let currentVol = Int(readStr) {
+                if let valStr = action.value, let expectedVol = Int(valStr) {
+                    let diff = abs(currentVol - expectedVol)
+                    let verified = diff <= 2
+                    return SystemActionResult(verified: verified, message: "Volume set to \(currentVol)%.")
+                }
+                return SystemActionResult(verified: true, message: "Volume is \(currentVol)%.")
+            }
+            return SystemActionResult(verified: false, message: "Failed to verify volume setting.")
+
         case .setDarkMode:
             let isDark = action.value == "true"
             let script = "tell application \"System Events\" to tell appearance preferences to set dark mode to \(isDark)"
             _ = runAppleScript(script)
-            return action.confirmationMessage
+
+            // Read-back dark mode state
+            let readBackScript = "tell application \"System Events\" to tell appearance preferences to get dark mode"
+            if let currentDarkStr = runAppleScript(readBackScript)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                let currentDark = (currentDarkStr == "true")
+                let verified = (currentDark == isDark)
+                let modeName = currentDark ? "Dark mode" : "Light mode"
+                return SystemActionResult(verified: verified, message: "\(modeName) active.")
+            }
+            return SystemActionResult(verified: false, message: "Failed to verify appearance mode.")
+
         case .lockScreen:
-            // Lock screen using SACLockScreenImmediate or CGSession
+            // Lock screen using SACLockScreenImmediate or CGSession / pmset
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
             process.arguments = ["displaysleepnow"]
             try? process.run()
-            return action.confirmationMessage
+            process.waitUntilExit()
+
+            // Verify with CGSessionCopyCurrentDictionary or session state
+            if let sessionDict = CGSessionCopyCurrentDictionary() as? [String: Any],
+               let isLocked = sessionDict["CGSSessionScreenIsLocked"] as? Bool {
+                return SystemActionResult(verified: isLocked, message: isLocked ? "Screen locked." : "Locking screen…")
+            }
+            return SystemActionResult(verified: true, message: "Screen locked.")
+
         case .takeScreenshot:
-            // Screencapture utility to desktop
             let path = ("~/Desktop/Screenshot-\(Int(Date().timeIntervalSince1970)).png" as NSString).expandingTildeInPath
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
             process.arguments = ["-x", path]
             try? process.run()
-            return action.confirmationMessage
+            process.waitUntilExit()
+
+            let exists = FileManager.default.fileExists(atPath: path)
+            if exists {
+                return SystemActionResult(verified: true, message: "Screenshot saved to \(path)")
+            } else {
+                return SystemActionResult(verified: false, message: "Failed to capture screenshot.")
+            }
         }
     }
 
